@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Name: netscaler_pitscaler_ioc_scan.sh
-# Version: 1.2
+# Version: 1.4
 # Author: Gunther De Poortere
 # License: MIT + COMMONS CLAUSE (see LICENSE). Provided AS IS, no warranty.
 #
@@ -17,7 +17,7 @@
 #              Scratch lists go to a private mktemp dir (mode 700) under /var/tmp.
 #
 # SAFETY     : NOTHING that is inspected is executed, sourced, loaded or interpreted.
-#              Files are only READ (od, grep, head, tail, ls, find, sha256 for baselines).
+#              Files are only READ (od, grep, head, tail, ls, find, sha256 for one baseline).
 #              No eval. No network traffic. PATH is reset.
 #              On a rooted appliance system tools can be trojaned: triage, not forensics.
 #
@@ -28,6 +28,8 @@
 #              CUSTOMSNMPD_SHA256=<hex>   baseline hash for /var/python/bin/customsnmpd (per firmware build)
 #              OWN_CMD_MODULES="CLI GUI UI"  CMD_EXECUTED modules skipped in logs when the header
 #                                         source IP is this appliance's NSIP (set "CLI" to narrow)
+#              OWN_TRAP_FILTER=1          also skip "SNMP TRAP_SENT ... netScalerConfigChange" lines with
+#                                         NSIP as header source (0 = disable)
 # Exit codes : 0 = nothing above WARNING, 1 = SUSPECTED, 2 = CONFIRMED, 3 = error
 #
 # Levels     : GREEN OK | YELLOW WARNING | ORANGE SUSPECTED | RED CONFIRMED
@@ -58,6 +60,8 @@ NS_BACKUP_PL_SHA256="${NS_BACKUP_PL_SHA256:-474e8f95bef654c6c6c423bf1bb5ec7d18c5
 CUSTOMSNMPD=/var/python/bin/customsnmpd
 CUSTOMSNMPD_SHA256="${CUSTOMSNMPD_SHA256:-1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe}"
 OWN_CMD_MODULES="${OWN_CMD_MODULES:-CLI GUI UI}"
+OWN_TRAP_FILTER="${OWN_TRAP_FILTER:-1}"
+case "$OWN_TRAP_FILTER" in 0|1) ;; *) OWN_TRAP_FILTER=1 ;; esac
 MAX_SCAN_KB=32768      # files above this size are not content-scanned
 MAX_HITS=50            # max printed hits per log file per level
 MAX_TTY_LEN=300        # terminal line truncation (report keeps full line)
@@ -176,7 +180,7 @@ elif command -v openssl >/dev/null 2>&1; then HASH_TOOL=openssl
 else HASH_TOOL=none; fi
 
 RE_SHA256='^[0-9a-f]{64}$'
-hash_file() {   # used only for baseline checks (section 3)
+hash_file() {   # used only for the ns_system_backup.pl baseline
     local h=""
     case "$HASH_TOOL" in
         sha256sum) h=$(sha256sum "$1" 2>/dev/null); h="${h#\\}"; h="${h%% *}" ;;
@@ -795,40 +799,61 @@ for c in /nsconfig/ns.conf /flash/nsconfig/ns.conf; do
 done
 [ "$s9" -eq 0 ] && ok "No sec_monitor account and no SAML action/IdP profile in ns.conf."
 
-# Own-config-command filter (used in section 10).
-# Header layout as seen on appliance ns.log:
-#   "<n>:Mon dd hh:mm:ss <facility.level> <NSIP>  <date> <TZ> <host> 0-PPE-0 : <partition> CLI CMD_EXECUTED <seq> 0 :  User <u> - ..."
-# Message body per NetScaler syslog reference (UI / CMD_EXECUTED):
-#   User %s - ADM_User %s - Remote_ip %s - Command "%s" - Status "%s"
+# Own-config-change filter (used in section 10). A log line is skipped only if:
+#   (a) the header source IP right after <facility.level> is this appliance's NSIP, AND
+#   (b) it is one of the two config-audit events:
+#       - "<MOD> CMD_EXECUTED ... User <u> - ..."  (MOD in OWN_CMD_MODULES)
+#         body per NetScaler syslog reference (UI/CMD_EXECUTED):
+#         User %s - ADM_User %s - Remote_ip %s - Command "%s" - Status "%s"
+#       - "SNMP TRAP_SENT ... : netScalerConfigChange (nsUserName = "<u>", configurationCmd = "...", ...)"
+#         trap objects per NS-ROOT-MIB (CTX122436): nsUserName, configurationCmd,
+#         authorizationStatus, commandExecutionStatus, sysIpAddress
+#   (c) the user field contains no shell metacharacters.
+# Header layout taken from appliance ns.log (not documented):
+#   "<n>:Mon dd hh:mm:ss <local0.info> <NSIP>  <date> GMT <host> 0-PPE-0 : <partition> <MOD> <EVENT> ..."
 OWN_MODS=""
 for m in $OWN_CMD_MODULES; do
     case "$m" in *[!A-Z]*|'') continue ;; esac
     OWN_MODS="${OWN_MODS:+$OWN_MODS|}$m"
 done
+OWN_MODS_DISP="${OWN_MODS//|/ }"
+OWN_DESC="${OWN_MODS_DISP:+$OWN_MODS_DISP CMD_EXECUTED}"
+[ "$OWN_TRAP_FILTER" = 1 ] && OWN_DESC="${OWN_DESC:+$OWN_DESC, }SNMP netScalerConfigChange trap"
 RE_OWN_MOD="[[:space:]](${OWN_MODS:-NONE})[[:space:]]+CMD_EXECUTED[[:space:]]"
+RE_OWN_TRAP='[[:space:]]SNMP[[:space:]]+TRAP_SENT[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+:[[:space:]]+netScalerConfigChange[[:space:]]*[(]nsUserName[[:space:]]*=[[:space:]]*"([^"]*)",[[:space:]]*configurationCmd[[:space:]]*='
 RE_OWN_SRC='<[A-Za-z0-9]+[.][A-Za-z]+>[[:space:]]+([0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3})[[:space:]]'
 RE_OWN_USER='[[:space:]]User[[:space:]]+([^[:space:]]+)[[:space:]]+-[[:space:]]'
-RE_OWN_BADU='[;|`&<>(){}$]'
+RE_OWN_BADU='[;|`&<>(){}$"]'
 OWN_WHY=""
-own_cmd() {   # true = own config command logged by this appliance (skip)
-    local src
+is_audit_line() { [[ $1 == *CMD_EXECUTED* || $1 == *netScalerConfigChange* ]]; }
+own_cmd() {   # true = own config change logged by this appliance (skip)
+    local line="$1" src user
     OWN_WHY=""
-    [[ $1 == *CMD_EXECUTED* ]] || { OWN_WHY="no CMD_EXECUTED"; return 1; }
     if [ -z "$NSIPS" ]; then OWN_WHY="NSIP unknown"; return 1; fi
-    if ! [[ $1 =~ $RE_OWN_MOD ]]; then OWN_WHY="module not in OWN_CMD_MODULES ($OWN_CMD_MODULES)"; return 1; fi
-    if ! [[ $1 =~ $RE_OWN_SRC ]]; then OWN_WHY="no '<facility.level> <IPv4>' header"; return 1; fi
+    if [[ $line == *CMD_EXECUTED* ]]; then
+        if ! [[ $line =~ $RE_OWN_MOD ]]; then OWN_WHY="CMD_EXECUTED module not in OWN_CMD_MODULES ($OWN_CMD_MODULES)"; return 1; fi
+        if ! [[ $line =~ $RE_OWN_USER ]]; then OWN_WHY="no 'User <name> -' field"; return 1; fi
+        user="${BASH_REMATCH[1]}"
+    elif [[ $line == *netScalerConfigChange* ]]; then
+        if [ "$OWN_TRAP_FILTER" != 1 ]; then OWN_WHY="OWN_TRAP_FILTER=0"; return 1; fi
+        if ! [[ $line =~ $RE_OWN_TRAP ]]; then OWN_WHY="netScalerConfigChange line not in expected 'SNMP TRAP_SENT ... (nsUserName = \"..\", configurationCmd =' format"; return 1; fi
+        user="${BASH_REMATCH[1]}"
+    else
+        OWN_WHY="not a config-audit event"; return 1
+    fi
+    if [ -z "$user" ]; then OWN_WHY="empty user field"; return 1; fi
+    if [[ $user =~ $RE_OWN_BADU ]]; then OWN_WHY="shell metacharacters in user field"; return 1; fi
+    if ! [[ $line =~ $RE_OWN_SRC ]]; then OWN_WHY="no '<facility.level> <IPv4>' header"; return 1; fi
     src="${BASH_REMATCH[1]}"
-    case " $NSIPS " in *" $src "*) ;; *) OWN_WHY="source $src is not NSIP ($NSIPS)"; return 1 ;; esac
-    if ! [[ $1 =~ $RE_OWN_USER ]]; then OWN_WHY="no 'User <name> -' field"; return 1; fi
-    if [[ ${BASH_REMATCH[1]} =~ $RE_OWN_BADU ]]; then OWN_WHY="shell metacharacters in user field"; return 1; fi
+    case " $NSIPS " in *" $src "*) ;; *) OWN_WHY="header source $src is not NSIP ($NSIPS)"; return 1 ;; esac
     return 0
 }
 if [ -z "$NSIPS" ]; then
-    warn "NSIP not found in ns.conf (set ns config -IPAddress): own-command log filter disabled"
-elif [ -z "$OWN_MODS" ]; then
-    warn "OWN_CMD_MODULES invalid: own-command log filter disabled"
+    warn "NSIP not found in ns.conf (set ns config -IPAddress): own-config-change log filter disabled"
+elif [ -z "$OWN_DESC" ]; then
+    warn "OWN_CMD_MODULES invalid and OWN_TRAP_FILTER=0: own-config-change log filter disabled"
 else
-    info "NSIP(s) from ns.conf: $NSIPS - '${OWN_MODS//|/\/} CMD_EXECUTED' log lines with this header source IP are skipped in section 10"
+    info "NSIP(s) from ns.conf: $NSIPS - log lines with this header source IP and event [$OWN_DESC] are skipped in section 10"
 fi
 
 # =====================================================================
@@ -941,7 +966,7 @@ cap_note() {
     [ "$SH_W" -gt "$MAX_HITS" ] && info "$1: $((SH_W-MAX_HITS)) more [WARNING] lines not shown (cap $MAX_HITS)"
     return 0
 }
-own_note() { [ "$2" -gt 0 ] && info "$1: $2 own config-command line(s) skipped (NSIP + ${OWN_MODS//|/\/} CMD_EXECUTED)"; return 0; }
+own_note() { [ "$2" -gt 0 ] && info "$1: $2 own config-change line(s) skipped (NSIP + $OWN_DESC)"; return 0; }
 
 META_RE='[;|`]|[$][(]|[$][{]IFS[}]|[$]IFS|b64decode|base64|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]]|/dev/tcp|nc[[:space:]]+-e|whoami|printf[[:space:]]'
 SYS_RE='pitboss|NSPPE|missed too many heartbeats|unexpectedly died|nsaaad.*(SIGNALED|EXITED)|maximum number of restarts|declaring system failure|All monitored processes have exited|scanner-probe|SSL_HANDSHAKE_FAILURE|[$][{]IFS[}]|b64decode'
@@ -956,7 +981,7 @@ if [ "$NSYS" -gt 0 ]; then
     log_stream "$f" | grep -nE -- "$SYS_RE" > "$L" 2>/dev/null
     while IFS= read -r line; do
         if own_cmd "$line"; then own_skip=$((own_skip+1)); continue; fi
-        [[ $line == *CMD_EXECUTED* ]] && line="$line  [own-command filter not applied: $OWN_WHY]"
+        is_audit_line "$line" && line="$line  [own-config filter not applied: $OWN_WHY]"
         if [[ $line == *SSL_HANDSHAKE_FAILURE* ]]; then
             [[ $line == *DTLS* ]] && dtls=1
             continue
@@ -1030,7 +1055,7 @@ if [ $((NSYS + NACC)) -gt 0 ]; then
     log_stream "$f" | grep -niwF "${IP_GREP_ARGS[@]}" "${DOM_GREP_ARGS[@]}" > "$L" 2>/dev/null
     while IFS= read -r line; do
         if own_cmd "$line"; then own_skip=$((own_skip+1)); continue; fi
-        nf=""; [[ $line == *CMD_EXECUTED* ]] && nf="  [own-command filter not applied: $OWN_WHY]"
+        nf=""; is_audit_line "$line" && nf="  [own-config filter not applied: $OWN_WHY]"
         lvl=""; what=""
         for ip in "${IP_STRONG[@]}"; do
             if [[ $line == *"$ip"* ]] && ip_in_line "$ip" "$line"; then lvl=S; what="IoC IP $ip"; break; fi
