@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 #
 # Name: netscaler_pitscaler_ioc_scan.sh
-# Version: 1.4
+# Version: 1.5
 # Author: Gunther De Poortere
 # License: MIT + COMMONS CLAUSE (see LICENSE). Provided AS IS, no warranty.
 #
 # IoC triage scanner for Citrix NetScaler ADC / Gateway:
 #   - CVE-2026-88771 / CVE-2026-88772 (bulletin CTX697096)
 #   - artefacts tied to the separate SAML issue (Citrix guidance 2 Oct 2026, no CVE yet)
+#   - SAML 2026 Go implant campaign: pylrk.cc / pyrlnk.cc dropper (.nsl payload)
 #
 # IoC source : PitScaler public IoC list https://pitscaler.com/netscaler-iocs/
 #              (snapshot "last updated 3 October 2026, 09:10 UTC") = pitscaler-iocs.csv
+#            + SAML 2026 dropper analysis (pylrk.cc/pyrlnk.cc campaign, f.pylrk.cc delivery):
+#              /nsconfig/.nsl Go implant, /var/nslog/.nsl fallback, ns_ctx.html uname marker,
+#              rc.netscaler persistence (nohup /nsconfig/.nsl /dev/null 2>&1 &)
 #
 # Compat     : GNU bash >= 3.2 (NetScaler ships 3.2.57 on FreeBSD).
 #              No associative arrays, no ${var,,}, no process substitution, no stat(1).
@@ -375,6 +379,12 @@ KNOWN_ARTEFACTS=(
   "C||/etc/httpd.conf.slap.bak|SAML-kit httpd.conf backup (Poppelgaard checker, single-source)"
   "S||/var/tmp/watchTowr|watchTowr detection-tool output: proves code execution, tester OR attacker"
   "S||/tmp/watchTowr|watchTowr detection-tool output: proves code execution, tester OR attacker"
+  # SAML 2026 dropper (pylrk.cc / pyrlnk.cc campaign, 2 Oct 2026)
+  # Stage 1 shell dropper: fetch -qo "$f" <URL>; chmod 755; nohup "$f" /dev/null 2>&1 &
+  # Stage 2: Go ELF x86-64 binary fetched from f.pylrk.cc
+  # Persistence: appends /usr/bin/nohup /nsconfig/.nsl /dev/null 2>&1 & to /nsconfig/rc.netscaler
+  "C||/nsconfig/.nsl|Go implant binary (SAML 2026 dropper, pylrk.cc campaign); persists via /nsconfig/rc.netscaler"
+  "C||/var/nslog/.nsl|Go implant fallback drop path (SAML 2026 dropper, pylrk.cc campaign; /var/nslog is volatile - no persistence)"
 )
 
 inspect_known() {
@@ -442,6 +452,19 @@ if [ -e "$p" ]; then
         *)                 suspect "$p present [$t] (LevelBlue config-staging name)" ;;
     esac
     detail "$(file_meta "$p")"
+fi
+# ns_ctx.html: SAML 2026 dropper (pylrk.cc campaign) overwrites this file with raw 'uname -srm' output
+# to let the attacker confirm RCE and detect the build. A legitimate HTML file never starts a line with
+# a bare kernel version string. Flag only on content match to avoid false positives on stock builds.
+p=/var/netscaler/logon/LogonPoint/ns_ctx.html
+if [ -f "$p" ] && ! is_seen "$p"; then
+    mark "$p"
+    if grep -aqE '^FreeBSD[[:space:]]+[0-9]' -- "$p" 2>/dev/null; then
+        s1=$((s1+1))
+        confirm "$p contains bare 'uname -srm' output (FreeBSD kernel string) - written by SAML 2026 dropper (pylrk.cc campaign)"
+        detail "$(file_meta "$p")"
+        detail "first line: $(head -n 1 -- "$p" 2>/dev/null | tr -dc '[:print:][:space:]')"
+    fi
 fi
 [ "$s1" -eq 0 ] && ok "None of the published artefact paths exist."
 
@@ -880,7 +903,7 @@ done
 PERSIST_FILES=( /etc/crontab /nsconfig/crontab /flash/nsconfig/crontab /var/cron/tabs/root
                 /nsconfig/rc.netscaler /flash/nsconfig/rc.netscaler
                 /nsconfig/nsbefore.sh /nsconfig/nsafter.sh /flash/nsconfig/nsbefore.sh /flash/nsconfig/nsafter.sh )
-P_CONF='nsmon[.]pl|[.]slap/|boot[.]sh|slapshot|whipd|/var/tmp/[.][A-Za-z]|/netscaler[.]local|[.]ns-cache'
+P_CONF='nsmon[.]pl|[.]slap/|boot[.]sh|slapshot|whipd|/var/tmp/[.][A-Za-z]|/netscaler[.]local|[.]ns-cache|[.]nsl'
 P_EXEC='[|;&][[:space:]]*(sh|bash|perl|python[0-9.]*)([[:space:]]|$)|base64|/dev/tcp|nc[[:space:]]+-e|(^|[[:space:]])/v([[:space:]]|$)|(^|[[:space:]])/[.]x([[:space:]]|$)|chmod[[:space:]]+[ugoa]*[+][rwxt]*s|chmod[[:space:]]+[2467][0-7][0-7][0-7]'
 P_DL='(^|[^A-Za-z0-9_./-])(curl|wget|fetch)([[:space:]]|$)'
 RE_URL_HOST='[A-Za-z][A-Za-z0-9+.-]*://([^/@[:space:]]+@)?([[][0-9A-Fa-f:.]+[]]|[A-Za-z0-9._-]+)'
