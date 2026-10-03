@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Name: netscaler_pitscaler_ioc_scan.sh
-# Version: 1.1
+# Version: 1.2
 # Author: Gunther De Poortere
 # License: MIT + COMMONS CLAUSE (see LICENSE). Provided AS IS, no warranty.
 #
@@ -17,7 +17,7 @@
 #              Scratch lists go to a private mktemp dir (mode 700) under /var/tmp.
 #
 # SAFETY     : NOTHING that is inspected is executed, sourced, loaded or interpreted.
-#              Files are only READ (od, grep, head, tail, ls, find, sha256 for one baseline).
+#              Files are only READ (od, grep, head, tail, ls, find, sha256 for baselines).
 #              No eval. No network traffic. PATH is reset.
 #              On a rooted appliance system tools can be trojaned: triage, not forensics.
 #
@@ -25,8 +25,9 @@
 #              NO_COLOR=1                 disable colours
 #              CHANGE_DAYS=30             window for customsnmpd change check (days)
 #              NS_BACKUP_PL_SHA256=<hex>  baseline hash for /var/tmp/ns_system_backup.pl
-#              OWN_CMD_MODULES="CLI"      CMD_EXECUTED modules to skip when logged by own NSIP
-#                                         (e.g. "CLI GUI" if mitigations were applied via GUI)
+#              CUSTOMSNMPD_SHA256=<hex>   baseline hash for /var/python/bin/customsnmpd (per firmware build)
+#              OWN_CMD_MODULES="CLI GUI UI"  CMD_EXECUTED modules skipped in logs when the header
+#                                         source IP is this appliance's NSIP (set "CLI" to narrow)
 # Exit codes : 0 = nothing above WARNING, 1 = SUSPECTED, 2 = CONFIRMED, 3 = error
 #
 # Levels     : GREEN OK | YELLOW WARNING | ORANGE SUSPECTED | RED CONFIRMED
@@ -54,7 +55,9 @@ CHANGE_DAYS="${CHANGE_DAYS:-30}"
 case "$CHANGE_DAYS" in ''|*[!0-9]*) CHANGE_DAYS=30 ;; esac
 NS_BACKUP_PL=/var/tmp/ns_system_backup.pl
 NS_BACKUP_PL_SHA256="${NS_BACKUP_PL_SHA256:-474e8f95bef654c6c6c423bf1bb5ec7d18c568da6f7c057fa5fb169fc933e45a}"
-OWN_CMD_MODULES="${OWN_CMD_MODULES:-CLI}"
+CUSTOMSNMPD=/var/python/bin/customsnmpd
+CUSTOMSNMPD_SHA256="${CUSTOMSNMPD_SHA256:-1dd0887ff21b18b0eb78a336e76d4dc3bb6f4fc645e9d864414a2958cb1637fe}"
+OWN_CMD_MODULES="${OWN_CMD_MODULES:-CLI GUI UI}"
 MAX_SCAN_KB=32768      # files above this size are not content-scanned
 MAX_HITS=50            # max printed hits per log file per level
 MAX_TTY_LEN=300        # terminal line truncation (report keeps full line)
@@ -173,7 +176,7 @@ elif command -v openssl >/dev/null 2>&1; then HASH_TOOL=openssl
 else HASH_TOOL=none; fi
 
 RE_SHA256='^[0-9a-f]{64}$'
-hash_file() {   # used only for the ns_system_backup.pl baseline
+hash_file() {   # used only for baseline checks (section 3)
     local h=""
     case "$HASH_TOOL" in
         sha256sum) h=$(sha256sum "$1" 2>/dev/null); h="${h#\\}"; h="${h%% *}" ;;
@@ -513,50 +516,50 @@ for d in "${VPN_DIRS[@]}"; do
 done
 
 # =====================================================================
-section "3. Stock files: customsnmpd change time, ns_system_backup.pl baseline"
-p=/var/python/bin/customsnmpd
-if [ -L "$p" ]; then
-    mark "$p"
-    suspect "$p is a symlink -> $(readlink -- "$p" 2>/dev/null)"
-elif [ ! -e "$p" ]; then
-    info "$p not present"
-else
-    mark "$p"
-    chg=$(find "$p" -prune \( -mtime -"$CHANGE_DAYS" -o -ctime -"$CHANGE_DAYS" \) -print 2>/dev/null)
-    if [ -n "$chg" ]; then
-        suspect "$p changed in the last $CHANGE_DAYS days (mtime or ctime) - compare with your last firmware upgrade date (LevelBlue: unexpected modification is a lead)"
+section "3. Stock files: SHA-256 baseline (customsnmpd, ns_system_backup.pl) + change time"
+# Sets BL_RES = ok | bad | none
+BL_RES=""
+check_baseline() {   # $1 path  $2 expected sha256  $3 report change time (1/0)
+    local p="$1" exp="$2" chk="$3" pr h chg
+    BL_RES=none
+    pr="$(realdir "$(dirname -- "$p")")/${p##*/}"
+    set_add S_BASE "$p"; set_add S_BASE "$pr"
+    if [ -L "$p" ]; then suspect "$p is a symlink -> $(readlink -- "$p" 2>/dev/null)"; mark "$p"; return 0; fi
+    if [ ! -e "$p" ]; then info "$p not present"; return 0; fi
+    if [ ! -f "$p" ]; then suspect "$p exists but is not a regular file"; mark "$p"; return 0; fi
+    if [ "$HASH_TOOL" = none ]; then
+        warn "$p: no SHA-256 tool available, baseline not verified"
     else
-        ok "$p not changed in the last $CHANGE_DAYS days (mtime and ctime)"
+        h=$(hash_file "$p")
+        if [ -z "$h" ]; then
+            warn "$p: SHA-256 could not be computed"
+        elif [ "$h" = "$exp" ]; then
+            BL_RES=ok; ok "$p matches baseline SHA-256"
+            mark "$p"; mark "$pr"
+        else
+            BL_RES=bad
+            suspect "$p SHA-256 deviates from baseline (expected $exp) - normal after a firmware upgrade (update baseline), otherwise investigate"
+            detail "found sha256=$h"
+        fi
+    fi
+    if [ "$chk" = 1 ]; then
+        chg=$(find "$p" -prune \( -mtime -"$CHANGE_DAYS" -o -ctime -"$CHANGE_DAYS" \) -print 2>/dev/null)
+        if [ -n "$chg" ]; then
+            if [ "$BL_RES" = none ]; then
+                suspect "$p changed in the last $CHANGE_DAYS days (mtime or ctime) and hash not verified - compare with last firmware upgrade"
+            else
+                info "$p changed in the last $CHANGE_DAYS days (mtime or ctime) - see hash verdict above"
+            fi
+        else
+            info "$p not changed in the last $CHANGE_DAYS days (mtime and ctime)"
+        fi
+        detail "ctime: $(file_ctime "$p")"
     fi
     detail "mtime: $(file_meta "$p")"
-    detail "ctime: $(file_ctime "$p")"
-fi
-
-p="$NS_BACKUP_PL"
-pr="$(realdir "$(dirname -- "$p")")/${p##*/}"
-set_add S_BASE "$p"; set_add S_BASE "$pr"
-if [ -L "$p" ]; then
-    suspect "$p is a symlink -> $(readlink -- "$p" 2>/dev/null)"
-elif [ ! -e "$p" ]; then
-    info "$p not present"
-elif [ ! -f "$p" ]; then
-    suspect "$p exists but is not a regular file"
-elif [ "$HASH_TOOL" = none ]; then
-    warn "$p present but no SHA-256 tool available: baseline not verified"
-    detail "$(file_meta "$p")"
-else
-    h=$(hash_file "$p")
-    if [ -z "$h" ]; then
-        warn "$p: SHA-256 could not be computed"
-    elif [ "$h" = "$NS_BACKUP_PL_SHA256" ]; then
-        ok "$p matches baseline SHA-256"
-        mark "$p"; mark "$pr"
-    else
-        suspect "$p SHA-256 deviates from baseline (expected $NS_BACKUP_PL_SHA256)"
-        detail "found sha256=$h"
-    fi
-    detail "$(file_meta "$p")"
-fi
+    return 0
+}
+check_baseline "$CUSTOMSNMPD" "$CUSTOMSNMPD_SHA256" 1
+check_baseline "$NS_BACKUP_PL" "$NS_BACKUP_PL_SHA256" 0
 
 # =====================================================================
 section "4. File-name patterns (content-verified)"
@@ -780,7 +783,7 @@ for c in /nsconfig/ns.conf /flash/nsconfig/ns.conf; do
         while IFS= read -r l; do info "$c system user (review manually): $l"; done <<< "$hits"
     fi
     # NSIP: "set ns config -IPAddress <ip_addr> -netmask <netmask>" (NetScaler CLI reference, ns-config)
-    hits=$(grep -E '^set ns config ' -- "$c" 2>/dev/null)
+    hits=$(grep -E '^set ns config[[:space:]]' -- "$c" 2>/dev/null)
     if [ -n "$hits" ]; then
         while IFS= read -r l; do
             if [[ $l =~ $RE_NSIP ]]; then
@@ -792,27 +795,41 @@ for c in /nsconfig/ns.conf /flash/nsconfig/ns.conf; do
 done
 [ "$s9" -eq 0 ] && ok "No sec_monitor account and no SAML action/IdP profile in ns.conf."
 
-# Own-config-command filter for log sections. Line layout taken from appliance ns.log:
-#   "<n>:Mon dd hh:mm:ss <facility.level> <NSIP>  <date:time> <TZ> <host> 0-PPE-0 : <partition> CLI CMD_EXECUTED <seq> 0 :  User <u> - ADM_User <a> - Remote_ip <ip> - Command "..."
+# Own-config-command filter (used in section 10).
+# Header layout as seen on appliance ns.log:
+#   "<n>:Mon dd hh:mm:ss <facility.level> <NSIP>  <date> <TZ> <host> 0-PPE-0 : <partition> CLI CMD_EXECUTED <seq> 0 :  User <u> - ..."
 # Message body per NetScaler syslog reference (UI / CMD_EXECUTED):
 #   User %s - ADM_User %s - Remote_ip %s - Command "%s" - Status "%s"
-OWN_RE=""
 OWN_MODS=""
 for m in $OWN_CMD_MODULES; do
     case "$m" in *[!A-Z]*|'') continue ;; esac
     OWN_MODS="${OWN_MODS:+$OWN_MODS|}$m"
 done
+RE_OWN_MOD="[[:space:]](${OWN_MODS:-NONE})[[:space:]]+CMD_EXECUTED[[:space:]]"
+RE_OWN_SRC='<[A-Za-z0-9]+[.][A-Za-z]+>[[:space:]]+([0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3})[[:space:]]'
+RE_OWN_USER='[[:space:]]User[[:space:]]+([^[:space:]]+)[[:space:]]+-[[:space:]]'
+RE_OWN_BADU='[;|`&<>(){}$]'
+OWN_WHY=""
+own_cmd() {   # true = own config command logged by this appliance (skip)
+    local src
+    OWN_WHY=""
+    [[ $1 == *CMD_EXECUTED* ]] || { OWN_WHY="no CMD_EXECUTED"; return 1; }
+    if [ -z "$NSIPS" ]; then OWN_WHY="NSIP unknown"; return 1; fi
+    if ! [[ $1 =~ $RE_OWN_MOD ]]; then OWN_WHY="module not in OWN_CMD_MODULES ($OWN_CMD_MODULES)"; return 1; fi
+    if ! [[ $1 =~ $RE_OWN_SRC ]]; then OWN_WHY="no '<facility.level> <IPv4>' header"; return 1; fi
+    src="${BASH_REMATCH[1]}"
+    case " $NSIPS " in *" $src "*) ;; *) OWN_WHY="source $src is not NSIP ($NSIPS)"; return 1 ;; esac
+    if ! [[ $1 =~ $RE_OWN_USER ]]; then OWN_WHY="no 'User <name> -' field"; return 1; fi
+    if [[ ${BASH_REMATCH[1]} =~ $RE_OWN_BADU ]]; then OWN_WHY="shell metacharacters in user field"; return 1; fi
+    return 0
+}
 if [ -z "$NSIPS" ]; then
     warn "NSIP not found in ns.conf (set ns config -IPAddress): own-command log filter disabled"
 elif [ -z "$OWN_MODS" ]; then
     warn "OWN_CMD_MODULES invalid: own-command log filter disabled"
 else
-    ipalt=""
-    for ip in $NSIPS; do ipalt="${ipalt:+$ipalt|}${ip//./[.]}"; done
-    OWN_RE="^[0-9]+:[A-Z][a-z][a-z] +[0-9]+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9] <[a-z0-9]+[.][a-z]+> +($ipalt) +[0-9/:]+ +[A-Za-z]+( +[^ ]+)? +[0-9]+-PPE-[0-9]+ +: +([^ ]+ +)?($OWN_MODS) CMD_EXECUTED [0-9]+ [0-9]+ : +User [-A-Za-z0-9._@]+ - (ADM_User [^ ]+ - )?Remote_ip [0-9A-Fa-f.:]+ - Command \""
-    info "NSIP(s) from ns.conf: $NSIPS - log lines '<NSIP> ... ${OWN_MODS//|/\/} CMD_EXECUTED' (clean user name) are skipped in section 10"
+    info "NSIP(s) from ns.conf: $NSIPS - '${OWN_MODS//|/\/} CMD_EXECUTED' log lines with this header source IP are skipped in section 10"
 fi
-own_cmd() { [ -n "$OWN_RE" ] && [[ $1 =~ $OWN_RE ]]; }
 
 # =====================================================================
 section "9. Privilege & persistence"
@@ -839,7 +856,34 @@ PERSIST_FILES=( /etc/crontab /nsconfig/crontab /flash/nsconfig/crontab /var/cron
                 /nsconfig/rc.netscaler /flash/nsconfig/rc.netscaler
                 /nsconfig/nsbefore.sh /nsconfig/nsafter.sh /flash/nsconfig/nsbefore.sh /flash/nsconfig/nsafter.sh )
 P_CONF='nsmon[.]pl|[.]slap/|boot[.]sh|slapshot|whipd|/var/tmp/[.][A-Za-z]|/netscaler[.]local|[.]ns-cache'
-P_SUSP='(curl|wget|fetch)[[:space:]].*([|]|;|-o)|[|][[:space:]]*(sh|bash|perl|python)|base64|/dev/tcp|nc[[:space:]]+-e|(^|[[:space:]])/v([[:space:]]|$)|(^|[[:space:]])/[.]x|chmod[[:space:]]+[ug]?[+]?s|chmod[[:space:]]+[2467][0-7][0-7][0-7]'
+P_EXEC='[|;&][[:space:]]*(sh|bash|perl|python[0-9.]*)([[:space:]]|$)|base64|/dev/tcp|nc[[:space:]]+-e|(^|[[:space:]])/v([[:space:]]|$)|(^|[[:space:]])/[.]x([[:space:]]|$)|chmod[[:space:]]+[ugoa]*[+][rwxt]*s|chmod[[:space:]]+[2467][0-7][0-7][0-7]'
+P_DL='(^|[^A-Za-z0-9_./-])(curl|wget|fetch)([[:space:]]|$)'
+RE_URL_HOST='[A-Za-z][A-Za-z0-9+.-]*://([^/@[:space:]]+@)?([[][0-9A-Fa-f:.]+[]]|[A-Za-z0-9._-]+)'
+remote_hosts() {   # prints URL hosts in $1 that are not loopback
+    local rest="$1" h i=0
+    while [ "$i" -lt 20 ] && [[ $rest =~ $RE_URL_HOST ]]; do
+        i=$((i+1))
+        h=$(lc "${BASH_REMATCH[2]}")
+        rest="${rest#*"${BASH_REMATCH[0]}"}"
+        case "$h" in
+            localhost|localhost.|127.*|'[::1]') ;;
+            *) printf '%s ' "$h" ;;
+        esac
+    done
+}
+cron_verdict() {   # sets CV_LVL (C/S/W/empty) and CV_WHY
+    local l="$1" rh
+    CV_LVL=""; CV_WHY=""
+    if [[ $l =~ $P_CONF ]]; then CV_LVL=C; CV_WHY="known implant persistence"
+    elif [[ $l =~ $P_EXEC ]]; then CV_LVL=S; CV_WHY="pipe-to-interpreter / encoding / reverse-shell / suid pattern"
+    elif [[ $l =~ $P_DL ]]; then
+        rh=$(remote_hosts "$l")
+        if [ -n "$rh" ]; then CV_LVL=S; CV_WHY="download tool contacting non-loopback host(s): ${rh% }"
+        elif ! [[ $l =~ $RE_URL_HOST ]]; then CV_LVL=W; CV_WHY="download tool without parsable URL"
+        fi
+    fi
+    return 0
+}
 s10b=0
 for pf in "${PERSIST_FILES[@]}"; do
     [ -f "$pf" ] || continue
@@ -849,8 +893,9 @@ for pf in "${PERSIST_FILES[@]}"; do
     while IFS= read -r raw || [ -n "$raw" ]; do
         n=$((n+1)); l="${raw#"${raw%%[![:space:]]*}"}"
         case "$l" in ''|'#'*) continue ;; esac
-        if [[ $l =~ $P_CONF ]]; then confirm "$pf:$n known implant persistence: $l"; s10b=$((s10b+1))
-        elif [[ $l =~ $P_SUSP ]]; then suspect "$pf:$n download/exec/suid pattern: $l"; s10b=$((s10b+1)); fi
+        cron_verdict "$l"
+        [ -n "$CV_LVL" ] || continue
+        emit_level "$CV_LVL" "$pf:$n $CV_WHY: $l"; s10b=$((s10b+1))
     done < "$pf"
 done
 [ "$s10b" -eq 0 ] && ok "No suspicious entries in crontab / rc.netscaler / nsbefore / nsafter."
@@ -911,6 +956,7 @@ if [ "$NSYS" -gt 0 ]; then
     log_stream "$f" | grep -nE -- "$SYS_RE" > "$L" 2>/dev/null
     while IFS= read -r line; do
         if own_cmd "$line"; then own_skip=$((own_skip+1)); continue; fi
+        [[ $line == *CMD_EXECUTED* ]] && line="$line  [own-command filter not applied: $OWN_WHY]"
         if [[ $line == *SSL_HANDSHAKE_FAILURE* ]]; then
             [[ $line == *DTLS* ]] && dtls=1
             continue
@@ -984,6 +1030,7 @@ if [ $((NSYS + NACC)) -gt 0 ]; then
     log_stream "$f" | grep -niwF "${IP_GREP_ARGS[@]}" "${DOM_GREP_ARGS[@]}" > "$L" 2>/dev/null
     while IFS= read -r line; do
         if own_cmd "$line"; then own_skip=$((own_skip+1)); continue; fi
+        nf=""; [[ $line == *CMD_EXECUTED* ]] && nf="  [own-command filter not applied: $OWN_WHY]"
         lvl=""; what=""
         for ip in "${IP_STRONG[@]}"; do
             if [[ $line == *"$ip"* ]] && ip_in_line "$ip" "$line"; then lvl=S; what="IoC IP $ip"; break; fi
@@ -1003,7 +1050,7 @@ if [ $((NSYS + NACC)) -gt 0 ]; then
             done
         fi
         [ -n "$lvl" ] || continue
-        show "$lvl" "$f: $what: $line"; s11=$((s11+1))
+        show "$lvl" "$f: $what: $line$nf"; s11=$((s11+1))
     done < "$L"
     cap_note "$f (IP/domain)"; own_note "$f (IP/domain)" "$own_skip"
   done
