@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Name: netscaler_pitscaler_ioc_scan.sh
-# Version: 1.5
+# Version: 1.8
 # Author: Gunther De Poortere
 # License: MIT + COMMONS CLAUSE (see LICENSE). Provided AS IS, no warranty.
 #
