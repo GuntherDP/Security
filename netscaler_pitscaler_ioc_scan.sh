@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 #
-# netscaler_pitscaler_ioc_scan.sh
-#
-# Version: 1.0
-# Author: Gunther De Poortere - Xcellerate - support@xcellerate.be
-# License: MIT (see LICENSE). Provided AS IS, no warranty.
+# Name: netscaler_pitscaler_ioc_scan.sh
+# Version: 1.1
+# Author: Gunther De Poortere
+# License: MIT + COMMONS CLAUSE (see LICENSE). Provided AS IS, no warranty.
 #
 # IoC triage scanner for Citrix NetScaler ADC / Gateway:
 #   - CVE-2026-88771 / CVE-2026-88772 (bulletin CTX697096)
@@ -13,20 +12,24 @@
 # IoC source : PitScaler public IoC list https://pitscaler.com/netscaler-iocs/
 #              (snapshot "last updated 3 October 2026, 09:10 UTC") = pitscaler-iocs.csv
 #
-# SAFETY     : NOTHING that is inspected is executed, sourced, loaded or interpreted.
-#              Files are only READ (od, grep, sha256/sha256sum, stat). No network traffic.
-#              PATH is reset so attacker-planted binaries elsewhere are not picked up.
-#              On a rooted appliance the system tools themselves can be trojaned:
-#              a live scan is triage, not forensics.
+# Compat     : GNU bash >= 3.2 (NetScaler ships 3.2.57 on FreeBSD).
+#              No associative arrays, no ${var,,}, no process substitution, no stat(1).
+#              Scratch lists go to a private mktemp dir (mode 700) under /var/tmp.
 #
-# Usage      : ./netscaler_pitscaler_ioc_scan.sh [/absolute/path/report.txt]
-#              NO_COLOR=1            -> disable colours
-#              STRICT_CUSTOMSNMPD=0  -> script at customsnmpd path without reverse-shell
-#                                       markers becomes SUSPECTED instead of CONFIRMED
+# SAFETY     : NOTHING that is inspected is executed, sourced, loaded or interpreted.
+#              Files are only READ (od, grep, head, tail, ls, find, sha256 for one baseline).
+#              No eval. No network traffic. PATH is reset.
+#              On a rooted appliance system tools can be trojaned: triage, not forensics.
+#
+# Usage      : bash ./netscaler_pitscaler_ioc_scan.sh [/absolute/path/report.txt]
+#              NO_COLOR=1                 disable colours
+#              CHANGE_DAYS=30             window for customsnmpd change check (days)
+#              NS_BACKUP_PL_SHA256=<hex>  baseline hash for /var/tmp/ns_system_backup.pl
+#              OWN_CMD_MODULES="CLI"      CMD_EXECUTED modules to skip when logged by own NSIP
+#                                         (e.g. "CLI GUI" if mitigations were applied via GUI)
 # Exit codes : 0 = nothing above WARNING, 1 = SUSPECTED, 2 = CONFIRMED, 3 = error
 #
 # Levels     : GREEN OK | YELLOW WARNING | ORANGE SUSPECTED | RED CONFIRMED
-#              Report file gets identical text, without colour codes.
 
 set -u
 set -o pipefail
@@ -37,17 +40,26 @@ export PATH
 unset CDPATH ENV BASH_ENV
 shopt -s nullglob
 
-if [ -z "${BASH_VERSINFO+x}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
-    printf 'ERROR: bash >= 4 required\n' >&2; exit 3
+if [ -z "${BASH_VERSINFO+x}" ]; then
+    printf 'ERROR: run this script with bash\n' >&2; exit 3
+fi
+if [ "${BASH_VERSINFO[0]}" -lt 3 ] || { [ "${BASH_VERSINFO[0]}" -eq 3 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+    printf 'ERROR: bash >= 3.2 required (found %s)\n' "$BASH_VERSION" >&2; exit 3
 fi
 if [ "$EUID" -ne 0 ]; then
     printf 'ERROR: must run as root\n' >&2; exit 3
 fi
 
-STRICT_CUSTOMSNMPD="${STRICT_CUSTOMSNMPD:-1}"
-MAX_SCAN_KB=32768      # files above this size are not hashed / content-scanned
+CHANGE_DAYS="${CHANGE_DAYS:-30}"
+case "$CHANGE_DAYS" in ''|*[!0-9]*) CHANGE_DAYS=30 ;; esac
+NS_BACKUP_PL=/var/tmp/ns_system_backup.pl
+NS_BACKUP_PL_SHA256="${NS_BACKUP_PL_SHA256:-474e8f95bef654c6c6c423bf1bb5ec7d18c568da6f7c057fa5fb169fc933e45a}"
+OWN_CMD_MODULES="${OWN_CMD_MODULES:-CLI}"
+MAX_SCAN_KB=32768      # files above this size are not content-scanned
 MAX_HITS=50            # max printed hits per log file per level
 MAX_TTY_LEN=300        # terminal line truncation (report keeps full line)
+
+realdir() { (cd -P -- "$1" 2>/dev/null && pwd -P); }
 
 # ---------------------------------------------------------------- report file
 REPORT="${1:-/var/tmp/pitscaler_ioc_report_$(date -u +%Y%m%d_%H%M%S).txt}"
@@ -62,8 +74,27 @@ fi
 if ! ( set -C; : > "$REPORT" ) 2>/dev/null; then
     printf 'ERROR: cannot create %s\n' "$REPORT" >&2; exit 3
 fi
+REPORT_REAL="$(realdir "$(dirname -- "$REPORT")")/${REPORT##*/}"
 SELF_SRC="${BASH_SOURCE[0]:-$0}"
 SELF_PATH="$(cd -- "$(dirname -- "$SELF_SRC")" 2>/dev/null && pwd -P)/${SELF_SRC##*/}"
+
+# ---------------------------------------------------------------- scratch dir
+TMPD=$(mktemp -d /var/tmp/pitscaler_scan.XXXXXX 2>/dev/null) || TMPD=""
+case "$TMPD" in
+    /var/tmp/pitscaler_scan.??????) ;;
+    *) printf 'ERROR: cannot create scratch dir under /var/tmp\n' >&2; exit 3 ;;
+esac
+TMPD_REAL=$(realdir "$TMPD")
+cleanup() {
+    case "${TMPD:-}" in
+        /var/tmp/pitscaler_scan.??????) [ -d "$TMPD" ] && rm -rf -- "$TMPD" ;;
+    esac
+}
+trap cleanup EXIT
+trap 'exit 3' INT TERM HUP
+TMPN=0
+TMPF=""
+newtmp() { TMPN=$((TMPN+1)); TMPF="$TMPD/l$TMPN"; : > "$TMPF"; }   # sets global TMPF
 
 # ---------------------------------------------------------------- colours
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -71,7 +102,7 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     C_BLUE=$'\033[0;36m';  C_BOLD=$'\033[1m';      C_RESET=$'\033[0m'
     case "${TERM:-}" in
         *256color*|*truecolor*|xterm-kitty|alacritty) C_ORANGE=$'\033[38;5;208m' ;;
-        *) C_ORANGE=$'\033[1;33m' ;;   # 8/16-colour terminal: no real orange, bold yellow
+        *) C_ORANGE=$'\033[1;33m' ;;
     esac
 else
     C_GREEN=''; C_YELLOW=''; C_ORANGE=''; C_RED=''; C_BLUE=''; C_BOLD=''; C_RESET=''
@@ -112,29 +143,28 @@ section() {
     printf '\n===== %s =====\n' "$*" >> "$REPORT"
 }
 
-# ---------------------------------------------------------------- portability helpers
-if stat -f '%z' / >/dev/null 2>&1; then STAT_FLAVOR=bsd; else STAT_FLAVOR=gnu; fi
+# ---------------------------------------------------------------- string sets (no assoc arrays)
+S_REPORTED=$'\n'; S_BASE=$'\n'
+S_D2=$'\n'; S_D4=$'\n'; S_D5=$'\n'; S_D6=$'\n'; S_CONF=$'\n'; S_P=$'\n'
+set_has() { local cur="${!1}"; case "$cur" in *$'\n'"$2"$'\n'*) return 0 ;; esac; return 1; }
+set_add() { local cur="${!1}"; case "$cur" in *$'\n'"$2"$'\n'*) return 0 ;; esac; printf -v "$1" '%s%s\n' "$cur" "$2"; }
+first_visit() { set_has "$1" "$2" && return 1; set_add "$1" "$2"; return 0; }
+mark()    { set_add S_REPORTED "$1"; }
+is_seen() { set_has S_REPORTED "$1"; }
+lc()      { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
+# ---------------------------------------------------------------- portability helpers
+# No stat(1): metadata via ls, time checks via find.
+if ls -lTd / >/dev/null 2>&1; then LS_M='-lTd'; LS_C='-lcTd'; else LS_M='-ld'; LS_C='-lcd'; fi
 file_meta() {
-    local out=""
-    if [ "$STAT_FLAVOR" = bsd ]; then
-        out=$(stat -f '%Sp owner=%Su:%Sg size=%z mtime=%Sm' -t '%Y-%m-%d %H:%M:%S' -- "$1" 2>/dev/null)
-    else
-        out=$(stat -c '%A owner=%U:%G size=%s mtime=%y' -- "$1" 2>/dev/null)
-    fi
-    printf '%s' "${out:-stat failed}"
+    local out
+    out=$(ls $LS_M "$1" 2>/dev/null)
+    printf '%s' "${out:-metadata unavailable}"
 }
-file_perms_L() {   # follows symlinks
-    if [ "$STAT_FLAVOR" = bsd ]; then stat -L -f '%Sp' -- "$1" 2>/dev/null
-    else stat -L -c '%A' -- "$1" 2>/dev/null; fi
-}
-file_size() {
-    if [ "$STAT_FLAVOR" = bsd ]; then stat -f '%z' -- "$1" 2>/dev/null
-    else stat -c '%s' -- "$1" 2>/dev/null; fi
-}
-too_big() {
-    local s; s=$(file_size "$1")
-    [ -n "$s" ] && [ "$s" -gt $((MAX_SCAN_KB * 1024)) ]
+file_ctime() {
+    local out
+    out=$(ls $LS_C "$1" 2>/dev/null)
+    printf '%s' "${out:-ctime unavailable}"
 }
 
 if command -v sha256sum >/dev/null 2>&1; then HASH_TOOL=sha256sum
@@ -142,15 +172,16 @@ elif command -v sha256 >/dev/null 2>&1;  then HASH_TOOL=sha256
 elif command -v openssl >/dev/null 2>&1; then HASH_TOOL=openssl
 else HASH_TOOL=none; fi
 
-hash_file() {
+RE_SHA256='^[0-9a-f]{64}$'
+hash_file() {   # used only for the ns_system_backup.pl baseline
     local h=""
     case "$HASH_TOOL" in
-        sha256sum) h=$(sha256sum -- "$1" 2>/dev/null); h="${h#\\}"; h="${h%% *}" ;;
-        sha256)    h=$(sha256 -q -- "$1" 2>/dev/null) ;;
+        sha256sum) h=$(sha256sum "$1" 2>/dev/null); h="${h#\\}"; h="${h%% *}" ;;
+        sha256)    h=$(sha256 -q "$1" 2>/dev/null) ;;
         openssl)   h=$(openssl dgst -sha256 -r "$1" 2>/dev/null); h="${h%% *}" ;;
     esac
-    h="${h,,}"
-    if [[ "$h" =~ ^[0-9a-f]{64}$ ]]; then printf '%s' "$h"; fi
+    h=$(lc "$h")
+    if [[ $h =~ $RE_SHA256 ]]; then printf '%s' "$h"; fi
 }
 
 # File type from magic bytes. Reads bytes only, never runs anything.
@@ -158,7 +189,7 @@ ftype() {
     local f="$1" hex tarm
     [ -f "$f" ] || { printf 'notfile'; return; }
     [ -s "$f" ] || { printf 'empty'; return; }
-    hex=$(od -An -tx1 -N 32 -v -- "$f" 2>/dev/null); hex="${hex//[[:space:]]/}"
+    hex=$(od -An -tx1 -N 32 -v "$f" 2>/dev/null); hex="${hex//[[:space:]]/}"
     case "$hex" in
         7f454c46*)                                   printf 'elf' ;;
         213c617263683e0a64656269616e2d62696e617279*) printf 'deb' ;;
@@ -172,9 +203,9 @@ ftype() {
         cafebabe*|cffaedfe*|cefaedfe*|feedface*|feedfacf*) printf 'macho' ;;
         2321*)                                       printf 'script' ;;
         *)
-            tarm=$(od -An -tx1 -j 257 -N 5 -v -- "$f" 2>/dev/null); tarm="${tarm//[[:space:]]/}"
+            tarm=$(od -An -tx1 -j 257 -N 5 -v "$f" 2>/dev/null); tarm="${tarm//[[:space:]]/}"
             if [ "$tarm" = "7573746172" ]; then printf 'tar'
-            elif od -An -tx1 -N 8192 -v -- "$f" 2>/dev/null | grep -qw '00'; then printf 'data'
+            elif od -An -tx1 -N 8192 -v "$f" 2>/dev/null | grep -qw '00'; then printf 'data'
             else printf 'text'; fi ;;
     esac
 }
@@ -182,23 +213,64 @@ ftype() {
 has_php()         { grep -aqE '<\?php' -- "$1" 2>/dev/null; }
 has_php_any()     { grep -aqE '<\?(php|=)' -- "$1" 2>/dev/null; }
 has_webshell_fn() { grep -aqiE '(eval|assert|system|passthru|shell_exec|proc_open|popen|pcntl_exec|base64_decode|gzinflate|str_rot13|create_function)[[:space:]]*\(' -- "$1" 2>/dev/null; }
-has_revshell()    { grep -aqiE 'socket\.socket|subprocess|pty\.spawn|os\.dup2|/bin/sh|/bin/bash|/dev/tcp/|connect\(\(|nc -e|45\.141\.21\.130' -- "$1" 2>/dev/null; }
 has_shell_cmds()  { grep -aqiE '(^|[;|&[:space:]])(curl|wget|fetch|nc|perl|python[0-9.]*|sh|bash|chmod|base64)[[:space:]]' -- "$1" 2>/dev/null; }
+
+# XML sanity check for files that must be pure XML (e.g. clientversions.xml).
+# Sets XV_LVL / XV_WHY. Reads only.
+RE_XML_CODE='<script|javascript:|#!/|/bin/(ba)?sh|/dev/tcp|(eval|system|exec|passthru|shell_exec|popen|proc_open|base64_decode|gzinflate)[[:space:]]*\(|<!ENTITY[^>]*SYSTEM'
+XV_LVL=""; XV_WHY=""
+xml_verdict() {
+    local f="$1" first last bad
+    XV_LVL=OK; XV_WHY="plain XML (starts with '<', ends with '>', no code markers)"
+    if has_php_any "$f"; then XV_LVL=C; XV_WHY="PHP code inside .xml"; return 0; fi
+    if grep -aqiE "$RE_XML_CODE" -- "$f" 2>/dev/null; then
+        XV_LVL=S; XV_WHY="script/exec markers inside .xml"; return 0
+    fi
+    bad=$(grep -aoE '<\?[A-Za-z][A-Za-z0-9_.-]*' -- "$f" 2>/dev/null | grep -avE '^<\?xml(-stylesheet)?$' | head -n 1)
+    if [ -n "$bad" ]; then XV_LVL=S; XV_WHY="non-XML processing instruction '$bad'"; return 0; fi
+    first=$(grep -av '^[[:space:]]*$' -- "$f" 2>/dev/null | head -n 1)
+    last=$(grep -av '^[[:space:]]*$' -- "$f" 2>/dev/null | tail -n 1)
+    first="${first#$'\xef\xbb\xbf'}"
+    first="${first#"${first%%[![:space:]]*}"}"
+    last="${last%"${last##*[![:space:]]}"}"
+    case "$first" in
+        '<'*) ;;
+        *) XV_LVL=S; XV_WHY="does not start with '<' (not XML)"; return 0 ;;
+    esac
+    case "$last" in
+        *'>') ;;
+        *) XV_LVL=S; XV_WHY="does not end with '>' (data appended after XML?)"; return 0 ;;
+    esac
+    return 0
+}
 
 re_escape() {
     local s="$1" out="" c i
     for (( i=0; i<${#s}; i++ )); do
         c="${s:i:1}"
         case "$c" in
-            '.'|'['|']'|'^'|'$'|'*'|'+'|'?'|'('|')'|'{'|'}'|'|'|"\\") out+="\\$c" ;;
-            *) out+="$c" ;;
+            '.'|'['|']'|'^'|'$'|'*'|'+'|'?'|'('|')'|'{'|'}'|'|'|"\\") out="$out\\$c" ;;
+            *) out="$out$c" ;;
         esac
     done
     printf '%s' "$out"
 }
 ip_in_line() {   # $1 ip  $2 line ; true if ip appears with non-digit boundaries
-    local re="(^|[^0-9])${1//./\\.}([^0-9]|\$)"
-    [[ "$2" =~ $re ]]
+    local re="(^|[^0-9])${1//./[.]}([^0-9]|\$)"
+    [[ $2 =~ $re ]]
+}
+
+is_excluded() {
+    local first=""
+    case "$1" in
+        "$REPORT"|"$REPORT_REAL"|"$SELF_PATH"|"$TMPD"/*|"$TMPD_REAL"/*) return 0 ;;
+        */pitscaler_ioc_report_*.txt)
+            IFS= read -r first < "$1" 2>/dev/null || first=""
+            case "$first" in
+                "NetScaler PitScaler IoC scan (read-only)"*) has_php_any "$1" || return 0 ;;
+            esac ;;
+    esac
+    return 1
 }
 
 # One process snapshot, taken once. Read-only.
@@ -207,7 +279,7 @@ PROCSTAT_SNAPSHOT=""
 if command -v procstat >/dev/null 2>&1; then
     PROCSTAT_SNAPSHOT=$(procstat -b -a 2>/dev/null || true)
 fi
-running_matches() {   # full-path token match only (avoids '/v' matching '/var/...')
+running_matches() {   # full-path token match only
     local re
     re="(^|[[:space:]=:])$(re_escape "$1")([[:space:]]|\$)"
     printf '%s\n%s\n' "$PS_SNAPSHOT" "$PROCSTAT_SNAPSHOT" | grep -E -- "$re" 2>/dev/null
@@ -217,45 +289,8 @@ print_procs() {
     while IFS= read -r l; do [ -n "$l" ] && detail "process: $l"; done <<< "$1"
 }
 
-declare -A REPORTED=()
-declare -A HASHED=()
-mark()   { REPORTED["$1"]=1; }
-is_seen(){ [ -n "${REPORTED[$1]:-}" ]; }
-is_excluded() {
-    case "$1" in
-        "$REPORT"|"$SELF_PATH"|*/pitscaler_ioc_report_*) return 0 ;;
-    esac
-    return 1
-}
-realdir() { (cd -P -- "$1" 2>/dev/null && pwd -P); }
-
 # ---------------------------------------------------------------- IoC data
-# Known-bad SHA-256 (PitScaler list). Many are per-victim / per-build: absence proves nothing.
-# Excluded on purpose: Unit 42 "Figure 1/2" hashes (hashes of text reproductions, not files).
-declare -A KNOWN_HASHES=(
-  ["6f5a2a452a7901323abd21879c6cecccb47c06aeeaccb1b467212f3b11e4b1e7"]="webshell (GreyNoise)"
-  ["ed082f744f035035900f67edf438f2f7d0528ac501234f63d476d65273cdb9a1"]=".ctxs.receiver sample (IFIN, single victim)"
-  ["5ea5ea61e9062822bee3f66ef5ff47c217178d9e31936ad6daf10c5dfae44d12"]="PHP webshell .ico variant (eSentire/Sygnia)"
-  ["7add390ceee4a1373211b3e340451b34f08965fc4d805f94c9b8cebdc0775774"]="PHP webshell .deb variant (eSentire)"
-  ["73b74309f4728d169cc9edfb2767c5aadd75d39b62de93c935a86c777d2646bc"]="payload /xd7h/x (Arctic Wolf)"
-  ["9c7bf01d2c2cb31a3609d27c1bc9abc60d86e37b7f9908547e0c75fb18b99aab"]="nsmon.pl implant (Arctic Wolf)"
-  ["57f9f30c50240fd48d761de7961a430cdebf2c084a36bc76d376a1ce8e6dfa9d"]="initial payload via 62.133.62.80 (Arctic Wolf)"
-  ["974b69782fdf5d67b97cfd508465939e44ee10798dbcc1e82b92d78776bad938"]="update_c08937.pl (Arctic Wolf/LevelBlue)"
-  ["927c7fbef2e620c1ce482c3ed67ebf53da97693c1d6c7552c77aec84ba982cf8"]="Platypus agent shell script (Arctic Wolf)"
-  ["ae22ef2517b5c0fb47f78745b9cb5260acee0e751b89bcd354640ff8bc8d29ec"]="nsg64.deb RC4 PHP webshell (Unit 42)"
-  ["e9fe43968c6c0955300e3bc4d7fb0b05a18570b4733aaf4f5c6f7f09be5a242c"]="main.py customsnmpd reverse-shell overwrite (LevelBlue)"
-  ["c98aee75c5e199c9b5527984ce48675d665963f7cab8ce9f2e82465de6b58727"]="Platypus agent freebsd/amd64 (TENEX)"
-  ["89b64bd45478e53299f9c422cbba40fac3ac0712b551b85185e38203f7f984c6"]="Platypus agent linux/amd64 (TENEX)"
-  ["be5832f3993ff63a36100b2f7b89c8d385e20dd9d72876700e7ade9fb9e6d4cb"]="Platypus agent UPX linux (TENEX)"
-  ["0dcac605a3a0c37001552369a6a77003226b35ddee7710b554fcd0e6809a76d1"]="Platypus agent windows/amd64 (TENEX)"
-  ["04db3fc44c81886844ef47949d7f352953a6bf1be4866be1fb3e7e12c452e3ac"]="Platypus agent darwin/arm64 (TENEX)"
-  ["2d2c2f6842982f7e1cb894ce915d39f2a9861009c7ecb1b90da803f2c3c608f4"]="Platypus agent linux/amd64 unpacked (TENEX)"
-  ["b9b0a4380db462c706597bd3e6a08d4d99fcbbf0919d63eb99b488d396c8ce63"]="Perl post-exploitation script, THOR rule match (weak evidence)"
-  ["0188b0eba4b01c4fb838df9d1d76c76d7f1dc22897e25161975b606c134c1027"]="ELF Sliver implant (NetScaler link via VT graph only)"
-  ["72cff13fcba75504485e94fa6bfc5e9363e860f49efdba68feb583148eec38f2"]="SAML-kit dropper 380d56 (Poppelgaard, community analysis)"
-)
-
-# IPv4: STRONG = PitScaler rows without a do-not-block caveat (92).
+# IPv4: STRONG = PitScaler rows without a do-not-block caveat.
 IP_STRONG=(
   149.104.78.141 104.248.244.66 139.180.152.138 77.83.199.39 78.135.96.136 149.28.29.221 80.240.22.229
   89.36.231.206 143.198.7.94 157.254.167.12 138.199.200.90 138.28.234.38 82.167.14.7 154.217.251.226
@@ -281,8 +316,7 @@ IP_NOISY=(
   49.36.107.103 191.37.30.194 23.234.74.48 72.73.231.73 95.229.84.239 113.137.102.68 125.122.56.47
   92.118.204.229
 )
-# Cloudflare WARP egress (104.28.193.147, 104.28.211.105, 104.28.215.136/137, 104.28.247.136/137)
-# deliberately NOT scanned: shared by unrelated users (GreyNoise/Unit 42/PitScaler).
+# Cloudflare WARP egress (104.28.x) deliberately NOT scanned: shared by unrelated users.
 
 DOMAINS_SUSP=( echvista.com entretiensol.com white-guard.pro garyvard.com hickoryusedauto.com
                gurerasfalt.com rockinroyaltykids.com currydownsrvpark.com pyrlnk.cc pylrk.cc )
@@ -290,17 +324,15 @@ DOMAINS_WARN=( instances.httpworkbench.com gsocket.io )
 
 IP_GREP_ARGS=();  for x in "${IP_STRONG[@]}" "${IP_NOISY[@]}"; do IP_GREP_ARGS+=( -e "$x" ); done
 DOM_GREP_ARGS=(); for x in "${DOMAINS_SUSP[@]}" "${DOMAINS_WARN[@]}"; do DOM_GREP_ARGS+=( -e "$x" ); done
-declare -A IS_NOISY=(); for x in "${IP_NOISY[@]}"; do IS_NOISY["$x"]=1; done
 
 # ---------------------------------------------------------------- banner
 printf '%sNetScaler PitScaler IoC scan (read-only)%s  %s\n' "$C_BOLD" "$C_RESET" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 printf 'NetScaler PitScaler IoC scan (read-only)  %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$REPORT"
 printf 'Legend: %s[OK]%s %s[WARNING]%s %s[SUSPECTED]%s %s[CONFIRMED]%s\n' \
     "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET" "$C_ORANGE" "$C_RESET" "$C_RED" "$C_RESET"
-info "Host: $(hostname 2>/dev/null)  Kernel: $(uname -sr 2>/dev/null)"
+info "Host: $(hostname 2>/dev/null)  Kernel: $(uname -sr 2>/dev/null)  Bash: $BASH_VERSION"
 info "Report: $REPORT"
-info "Tools: stat=$STAT_FLAVOR hash=$HASH_TOOL procstat=$([ -n "$PROCSTAT_SNAPSHOT" ] && echo yes || echo no)"
-[ "$HASH_TOOL" = none ] && warn "No SHA-256 tool found: hash checks disabled."
+info "Tools: ls=$LS_M hash=$HASH_TOOL procstat=$([ -n "$PROCSTAT_SNAPSHOT" ] && echo yes || echo no)"
 [ -z "$PS_SNAPSHOT" ] && warn "Process snapshot empty: 'is it running' checks disabled."
 
 # =====================================================================
@@ -339,7 +371,7 @@ KNOWN_ARTEFACTS=(
 )
 
 inspect_known() {
-    local lvl="$1" esc="$2" p="$3" note="$4" t run sub n=0
+    local lvl="$1" esc="$2" p="$3" note="$4" t run sub n=0 L
     if [ -L "$p" ]; then
         emit_level "$lvl" "Symlink present: $p -> $(readlink -- "$p" 2>/dev/null) ($note)"
         mark "$p"; return 0
@@ -349,14 +381,16 @@ inspect_known() {
     if [ -d "$p" ]; then
         emit_level "$lvl" "Directory present: $p ($note)"
         detail "$(file_meta "$p")"
+        newtmp; L="$TMPF"
+        find "$p" -xdev -mindepth 1 -maxdepth 3 -print0 > "$L" 2>/dev/null
         while IFS= read -r -d '' sub; do
             n=$((n+1))
             if [ "$n" -gt 25 ]; then detail "... further entries not listed"; break; fi
             mark "$sub"
-            detail "entry: $sub [$(ftype "$sub")] $(file_meta "$sub")"
+            detail "entry [$(ftype "$sub")]: $(file_meta "$sub")"
             run=$(running_matches "$sub")
             if [ -n "$run" ]; then confirm "Running process references $sub"; print_procs "$run"; fi
-        done < <(find "$p" -xdev -mindepth 1 -maxdepth 3 -print0 2>/dev/null)
+        done < "$L"
         return 0
     fi
     t=$(ftype "$p")
@@ -373,29 +407,16 @@ inspect_known() {
     else
         emit_level "$lvl" "File present: $p [$t] ($note)"
     fi
-    describe_file "$p"
+    detail "$(file_meta "$p")"
     return 0
-}
-
-describe_file() {
-    local f="$1" h k
-    detail "$(file_meta "$f")"
-    if too_big "$f"; then detail "sha256 skipped (> ${MAX_SCAN_KB} KB)"; return; fi
-    h=$(hash_file "$f")
-    HASHED["$f"]=1
-    [ -n "$h" ] || return
-    k="${KNOWN_HASHES[$h]:-}"
-    detail "sha256=$h"
-    [ -n "$k" ] && confirm "Known-bad SHA-256 on $f: $k"
 }
 
 s1=0
 for entry in "${KNOWN_ARTEFACTS[@]}"; do
     IFS='|' read -r lvl esc p note <<< "$entry"
-    inspect_known "$lvl" "$esc" "$p" "$note" && s1=$((s1+1))
+    if inspect_known "$lvl" "$esc" "$p" "$note"; then s1=$((s1+1)); fi
 done
 
-# insight-new.js: Sygnia/LevelBlue saw ns.conf copied to this name. Verify content.
 p=/var/netscaler/logon/insight-new.js
 if [ -e "$p" ]; then
     s1=$((s1+1)); mark "$p"
@@ -404,9 +425,8 @@ if [ -e "$p" ]; then
     else
         suspect "$p present, content not ns.conf-like [$(ftype "$p")] (Sygnia/LevelBlue artefact name)"
     fi
-    describe_file "$p"
+    detail "$(file_meta "$p")"
 fi
-# xua.html: LevelBlue saw a tar of /flash/nsconfig under this name.
 p=/var/netscaler/logon/LogonPoint/xua.html
 if [ -e "$p" ]; then
     s1=$((s1+1)); mark "$p"; t=$(ftype "$p")
@@ -414,30 +434,25 @@ if [ -e "$p" ]; then
         tar|gzip|bzip2|xz) confirm "$p is a $t archive disguised as .html (config staging, LevelBlue)" ;;
         *)                 suspect "$p present [$t] (LevelBlue config-staging name)" ;;
     esac
-    describe_file "$p"
+    detail "$(file_meta "$p")"
 fi
 [ "$s1" -eq 0 ] && ok "None of the published artefact paths exist."
 
 # =====================================================================
 section "2. VPN client download dirs (/vpn/scripts/linux) - content classification"
-# Stock content = Linux VPN client packages (.deb/.rpm). WHIPSHOT & co are PHP text named
-# .deb/.sig (GTIG, eSentire, Unit 42). PitScaler: "look for ASCII text or PHP markers".
 VPN_DIRS=( /netscaler/ns_gui/vpn/scripts/linux /var/netscaler/gui/vpn/scripts/linux )
 UNIT42_DEB_NAMES='nsg64.deb nsgser18.deb nsgsupport.deb nsgpackage64.deb nsgbuild.deb'
 
 classify_vpn_file() {
-    local f="$1" name ext t run h k lvl why namenote=""
-    name="${f##*/}"; ext="${name##*.}"; [ "$ext" = "$name" ] && ext=""; ext="${ext,,}"
-    is_excluded "$f" && return
+    local f="$1" name ext t run lvl why namenote=""
+    name="${f##*/}"; ext="${name##*.}"; [ "$ext" = "$name" ] && ext=""; ext=$(lc "$ext")
+    is_excluded "$f" && return 0
     mark "$f"
     if [ -L "$f" ]; then
-        suspect "Symlink in VPN client dir: $f -> $(readlink -- "$f" 2>/dev/null)"; return
+        suspect "Symlink in VPN client dir: $f -> $(readlink -- "$f" 2>/dev/null)"; return 0
     fi
     t=$(ftype "$f")
     run=$(running_matches "$f")
-    h=""; k=""
-    if ! too_big "$f"; then h=$(hash_file "$f"); HASHED["$f"]=1; fi
-    [ -n "$h" ] && k="${KNOWN_HASHES[$h]:-}"
 
     case " $UNIT42_DEB_NAMES " in *" $name "*) namenote="name on Unit 42 .deb-webshell list" ;; esac
     case "$name" in
@@ -445,8 +460,7 @@ classify_vpn_file() {
         nsgclient.sig|e6ee7c85.sig|80974ca9.sig|LoginIcon.sig) namenote="published webshell file name" ;;
     esac
 
-    if [ -n "$k" ]; then lvl=C; why="known-bad SHA-256: $k"
-    elif [ -n "$run" ]; then lvl=C; why="referenced by a running process"
+    if [ -n "$run" ]; then lvl=C; why="referenced by a running process"
     else
         case "$t" in
             deb|rpm)
@@ -459,6 +473,7 @@ classify_vpn_file() {
                 lvl=C; why="executable script (#!) in VPN client dir" ;;
             text)
                 if has_php_any "$f"; then lvl=C; why="PHP code in text file (WHIPSHOT/.sig/.deb webshell pattern)"
+                elif [ "$ext" = xml ]; then xml_verdict "$f"; lvl="$XV_LVL"; why="$XV_WHY"
                 elif [ "$ext" = deb ] || [ "$ext" = rpm ]; then lvl=C; why="plain text masquerading as .$ext"
                 else lvl=S; why="text file without PHP markers"; fi ;;
             gzip|bzip2|xz|zip|tar|ar)
@@ -467,6 +482,7 @@ classify_vpn_file() {
             data)
                 if has_php "$f"; then lvl=C; why="binary data containing '<?php'"
                 elif [ "$ext" = sig ]; then lvl=W; why="binary .sig (may be a real signature; known .sig webshells are PHP text)"
+                elif [ "$ext" = xml ]; then lvl=S; why="binary content in .xml file"
                 else lvl=S; why="unrecognised binary content"; fi ;;
             empty) lvl=W; why="empty file" ;;
             *)     lvl=S; why="unclassified ($t)" ;;
@@ -474,63 +490,77 @@ classify_vpn_file() {
     fi
     if [ "$ext" = php ] && [ "$lvl" != C ]; then lvl=C; why="$why; .php in /vpn/scripts/linux (GTIG staging pattern)"; fi
     if [ -n "$namenote" ] && [ "$lvl" = OK ]; then lvl=W; why="$why, but $namenote"; fi
-    [ -n "$namenote" ] && [ "$lvl" != W ] && why="$why; $namenote"
+    if [ -n "$namenote" ] && [ "$lvl" != W ]; then why="$why; $namenote"; fi
 
     emit_level "$lvl" "$f [$t]: $why"
     detail "$(file_meta "$f")"
-    [ -n "$h" ] && detail "sha256=$h"
     [ -n "$run" ] && print_procs "$run"
+    return 0
 }
 
-declare -A SEEN_DIR=()
 for d in "${VPN_DIRS[@]}"; do
     if [ ! -d "$d" ]; then info "$d not present"; continue; fi
     rd=$(realdir "$d"); [ -n "$rd" ] || continue
-    if [ -n "${SEEN_DIR[$rd]:-}" ]; then info "$d resolves to $rd (already scanned)"; continue; fi
-    SEEN_DIR["$rd"]=1
+    if ! first_visit S_D2 "$rd"; then info "$d resolves to $rd (already scanned)"; continue; fi
     warn "Directory present: $d (stock VPN client location; also WHIPSHOT location per GTIG) - contents classified below"
     cnt=0
+    newtmp; L="$TMPF"
+    find "$rd" -xdev -mindepth 1 -maxdepth 2 \( -type f -o -type l \) -print0 > "$L" 2>/dev/null
     while IFS= read -r -d '' f; do
         cnt=$((cnt+1)); classify_vpn_file "$f"
-    done < <(find "$rd" -xdev -mindepth 1 -maxdepth 2 \( -type f -o -type l \) -print0 2>/dev/null)
+    done < "$L"
     [ "$cnt" -eq 0 ] && info "$d is empty"
 done
 
 # =====================================================================
-section "3. /var/python/bin/customsnmpd integrity"
+section "3. Stock files: customsnmpd change time, ns_system_backup.pl baseline"
 p=/var/python/bin/customsnmpd
-if [ ! -e "$p" ]; then
+if [ -L "$p" ]; then
+    mark "$p"
+    suspect "$p is a symlink -> $(readlink -- "$p" 2>/dev/null)"
+elif [ ! -e "$p" ]; then
     info "$p not present"
 else
     mark "$p"
-    t=$(ftype "$p"); h=""; k=""
-    if ! too_big "$p"; then h=$(hash_file "$p"); HASHED["$p"]=1; fi
-    [ -n "$h" ] && k="${KNOWN_HASHES[$h]:-}"
-    if [ -n "$k" ]; then
-        confirm "$p matches known-bad SHA-256: $k"
+    chg=$(find "$p" -prune \( -mtime -"$CHANGE_DAYS" -o -ctime -"$CHANGE_DAYS" \) -print 2>/dev/null)
+    if [ -n "$chg" ]; then
+        suspect "$p changed in the last $CHANGE_DAYS days (mtime or ctime) - compare with your last firmware upgrade date (LevelBlue: unexpected modification is a lead)"
     else
-        case "$t" in
-            elf) ok "$p is an ELF binary (expected)" ;;
-            script|text)
-                if has_revshell "$p"; then
-                    confirm "$p is a $t file with reverse-shell markers (LevelBlue main.py overwrite pattern)"
-                elif [ "$STRICT_CUSTOMSNMPD" = 1 ]; then
-                    confirm "$p is a $t file, not a binary (STRICT_CUSTOMSNMPD=1)"
-                else
-                    suspect "$p is a $t file without reverse-shell markers - compare with clean appliance, same build"
-                fi ;;
-            *) suspect "$p unexpected type [$t]" ;;
-        esac
+        ok "$p not changed in the last $CHANGE_DAYS days (mtime and ctime)"
+    fi
+    detail "mtime: $(file_meta "$p")"
+    detail "ctime: $(file_ctime "$p")"
+fi
+
+p="$NS_BACKUP_PL"
+pr="$(realdir "$(dirname -- "$p")")/${p##*/}"
+set_add S_BASE "$p"; set_add S_BASE "$pr"
+if [ -L "$p" ]; then
+    suspect "$p is a symlink -> $(readlink -- "$p" 2>/dev/null)"
+elif [ ! -e "$p" ]; then
+    info "$p not present"
+elif [ ! -f "$p" ]; then
+    suspect "$p exists but is not a regular file"
+elif [ "$HASH_TOOL" = none ]; then
+    warn "$p present but no SHA-256 tool available: baseline not verified"
+    detail "$(file_meta "$p")"
+else
+    h=$(hash_file "$p")
+    if [ -z "$h" ]; then
+        warn "$p: SHA-256 could not be computed"
+    elif [ "$h" = "$NS_BACKUP_PL_SHA256" ]; then
+        ok "$p matches baseline SHA-256"
+        mark "$p"; mark "$pr"
+    else
+        suspect "$p SHA-256 deviates from baseline (expected $NS_BACKUP_PL_SHA256)"
+        detail "found sha256=$h"
     fi
     detail "$(file_meta "$p")"
-    [ -n "$h" ] && detail "sha256=$h"
-    run=$(running_matches "$p"); [ -n "$run" ] && { detail "running instances (expected for stock binary):"; print_procs "$run"; }
 fi
 
 # =====================================================================
 section "4. File-name patterns (content-verified)"
 PATTERN_DIRS=( /var/netscaler/logon /netscaler/ns_gui /var/netscaler/gui /var/tmp /tmp )
-# pattern|level|note
 NAME_IOCS=(
   "nginstaller*|S|GTIG installer-webshell name pattern"
   "nsgclient.sig|S|GTIG .sig webshell name"
@@ -564,37 +594,39 @@ done
 FIND_NAMES+=( \) )
 
 s4=0
-declare -A SEEN_DIR4=()
 for d in "${PATTERN_DIRS[@]}"; do
     [ -d "$d" ] || continue
     rd=$(realdir "$d"); [ -n "$rd" ] || continue
-    [ -n "${SEEN_DIR4[$rd]:-}" ] && continue; SEEN_DIR4["$rd"]=1
+    first_visit S_D4 "$rd" || continue
+    newtmp; L="$TMPF"
+    find "$rd" -xdev -maxdepth 5 "${FIND_NAMES[@]}" -print0 > "$L" 2>/dev/null
     while IFS= read -r -d '' f; do
         is_excluded "$f" && continue
         is_seen "$f" && continue
+        set_has S_BASE "$f" && continue          # handled in section 3
         mark "$f"; name="${f##*/}"; lvl=I; note=""
         for e in "${NAME_IOCS[@]}"; do
             IFS='|' read -r pat l n <<< "$e"
-            # shellcheck disable=SC2053
-            if [[ "$name" == $pat ]]; then lvl="$l"; note="$n"; break; fi
+            if [[ $name == $pat ]]; then lvl="$l"; note="$n"; break; fi
         done
         t=$(ftype "$f")
         if [ -f "$f" ] && has_php_any "$f"; then lvl=C; note="$note; contains PHP code"; fi
         run=$(running_matches "$f")
         if [ -n "$run" ]; then lvl=C; note="$note; referenced by running process"; fi
         emit_level "$lvl" "$f [$t]: $note"
-        [ -f "$f" ] && describe_file "$f"
+        detail "$(file_meta "$f")"
         [ -n "$run" ] && print_procs "$run"
         s4=$((s4+1))
-    done < <(find "$rd" -xdev -maxdepth 5 "${FIND_NAMES[@]}" -print0 2>/dev/null)
+    done < "$L"
 done
-# nsaaad crash cores (SAML-issue crash loop; crash != compromise)
 ncore=0
 if [ -d /var/core ]; then
+    newtmp; L="$TMPF"
+    find /var/core -xdev -maxdepth 3 -type f -name 'nsaaad-*.gz' -mtime -30 -print0 > "$L" 2>/dev/null
     while IFS= read -r -d '' f; do
         ncore=$((ncore+1))
         [ "$ncore" -le 10 ] && warn "nsaaad core dump (last 30 days): $f - preserve, correlate with SAML requests, involve Citrix Support"
-    done < <(find /var/core -xdev -maxdepth 3 -type f -name 'nsaaad-*.gz' -mtime -30 -print0 2>/dev/null)
+    done < "$L"
     [ "$ncore" -gt 10 ] && info "$((ncore-10)) more nsaaad core dumps not listed"
 fi
 [ "$s4" -eq 0 ] && ok "No published file-name patterns found."
@@ -604,26 +636,28 @@ section "5. PHP code in non-.php files (web and temp dirs)"
 HIGH_RISK_DIRS=( /var/netscaler/logon/LogonPoint/custom /var/netscaler/logon/themes /var/tmp /tmp )
 WEB_DIRS=( /var/netscaler/logon /netscaler/ns_gui/vpn /var/netscaler/gui/vpn )
 s5=0
-declare -A SEEN_DIR5=()
-scan_php_dir() {   # $1 dir  $2 risk(high|web)
-    local d="$1" risk="$2" rd f lvl
-    [ -d "$d" ] || return
-    rd=$(realdir "$d"); [ -n "$rd" ] || return
-    [ -n "${SEEN_DIR5[$rd]:-}" ] && return; SEEN_DIR5["$rd"]=1
+scan_php_dir() {
+    local d="$1" risk="$2" rd f lvl L
+    [ -d "$d" ] || return 0
+    rd=$(realdir "$d"); [ -n "$rd" ] || return 0
+    first_visit S_D5 "$rd" || return 0
+    newtmp; L="$TMPF"
+    find "$rd" -xdev -type f ! -name '*.php' ! -name '*.phtml' ! -name '*.inc' -size -"${MAX_SCAN_KB}"k -print0 > "$L" 2>/dev/null
     while IFS= read -r -d '' f; do
         is_excluded "$f" && continue
         is_seen "$f" && continue
         has_php "$f" || continue
         mark "$f"
         if has_webshell_fn "$f"; then
-            [ "$risk" = high ] && lvl=C || lvl=S
+            if [ "$risk" = high ]; then lvl=C; else lvl=S; fi
             emit_level "$lvl" "PHP with exec/eval/decode functions in non-.php file: $f"
         else
-            [ "$risk" = high ] && lvl=S || lvl=W
+            if [ "$risk" = high ]; then lvl=S; else lvl=W; fi
             emit_level "$lvl" "PHP code in non-.php file: $f (compare with clean appliance, same build)"
         fi
-        describe_file "$f"; s5=$((s5+1))
-    done < <(find "$rd" -xdev -type f ! -name '*.php' ! -name '*.phtml' ! -name '*.inc' -size -"${MAX_SCAN_KB}"k -print0 2>/dev/null)
+        detail "$(file_meta "$f")"; s5=$((s5+1))
+    done < "$L"
+    return 0
 }
 for d in "${HIGH_RISK_DIRS[@]}"; do scan_php_dir "$d" high; done
 for d in "${WEB_DIRS[@]}";       do scan_php_dir "$d" web;  done
@@ -631,7 +665,6 @@ for d in "${WEB_DIRS[@]}";       do scan_php_dir "$d" web;  done
 
 # =====================================================================
 section "6. IoC strings inside files"
-# string|level|note
 STRING_IOCS=(
   "UXD_IDLE_EXIT|C|SLAPSHOT tunneler variable (GTIG)"
   "HTTP_X_UX|C|WHIPSHOT chunked base64 header (GTIG)"
@@ -656,11 +689,12 @@ STRING_DIRS=( /var/netscaler/logon /netscaler/ns_gui /var/netscaler/gui /var/tmp
               /var/core/.ns-cache /netscaler.local /var/python/bin /nsconfig /flash/nsconfig )
 STR_GREP_ARGS=(); for e in "${STRING_IOCS[@]}"; do STR_GREP_ARGS+=( -e "${e%%|*}" ); done
 s6=0
-declare -A SEEN_DIR6=()
 for d in "${STRING_DIRS[@]}"; do
     [ -d "$d" ] || continue
     rd=$(realdir "$d"); [ -n "$rd" ] || continue
-    [ -n "${SEEN_DIR6[$rd]:-}" ] && continue; SEEN_DIR6["$rd"]=1
+    first_visit S_D6 "$rd" || continue
+    newtmp; L="$TMPF"
+    find "$rd" -xdev -type f -size -"${MAX_SCAN_KB}"k -print0 > "$L" 2>/dev/null
     while IFS= read -r -d '' f; do
         is_excluded "$f" && continue
         is_seen "$f" && continue
@@ -674,47 +708,19 @@ for d in "${STRING_DIRS[@]}"; do
             fi
         done
         emit_level "${best:-S}" "IoC string(s) in $f: $notes"
-        describe_file "$f"; mark "$f"; s6=$((s6+1))
-    done < <(find "$rd" -xdev -type f -size -"${MAX_SCAN_KB}"k -print0 2>/dev/null)
+        detail "$(file_meta "$f")"; mark "$f"; s6=$((s6+1))
+    done < "$L"
 done
 [ "$s6" -eq 0 ] && ok "No IoC strings found in scanned files."
 
 # =====================================================================
-section "7. SHA-256 sweep"
-if [ "$HASH_TOOL" = none ]; then
-    warn "Skipped: no SHA-256 tool."
-else
-    HASH_DIRS=( /var/netscaler/logon /netscaler/ns_gui /var/netscaler/gui /var/tmp /tmp
-                /var/core/.ns-cache /netscaler.local /var/python/bin /nsconfig /flash/nsconfig )
-    s7=0; nh=0
-    declare -A SEEN_DIR7=()
-    hash_one() {
-        local f="$1" h k
-        is_excluded "$f" && return
-        [ -n "${HASHED[$f]:-}" ] && return
-        HASHED["$f"]=1; nh=$((nh+1))
-        h=$(hash_file "$f"); [ -n "$h" ] || return
-        k="${KNOWN_HASHES[$h]:-}"
-        if [ -n "$k" ]; then
-            confirm "Known-bad SHA-256 on $f: $k"; detail "$(file_meta "$f")"; detail "sha256=$h"; s7=$((s7+1))
-        fi
-    }
-    for d in "${HASH_DIRS[@]}"; do
-        [ -d "$d" ] || continue
-        rd=$(realdir "$d"); [ -n "$rd" ] || continue
-        [ -n "${SEEN_DIR7[$rd]:-}" ] && continue; SEEN_DIR7["$rd"]=1
-        while IFS= read -r -d '' f; do hash_one "$f"; done \
-            < <(find "$rd" -xdev -type f -size -"${MAX_SCAN_KB}"k -print0 2>/dev/null)
-    done
-    while IFS= read -r -d '' f; do hash_one "$f"; done \
-        < <(find / -xdev -maxdepth 1 -type f -size -"${MAX_SCAN_KB}"k -print0 2>/dev/null)
-    info "Hashed $nh additional files."
-    [ "$s7" -eq 0 ] && ok "No known-bad hashes in sweep (hashes are per-victim/per-build: absence proves nothing)."
-fi
-
-# =====================================================================
-section "8. httpd.conf"
+section "7. httpd.conf"
 HTTPD_CONF=/etc/httpd.conf
+RE_HANDLER='^(AddHandler|AddType)[[:space:]]+application/x-httpd-php[^[:space:]]*[[:space:]]+(.+)$'
+RE_SETH='^SetHandler[[:space:]]+application/x-httpd-php'
+RE_ALIAS='^(Alias|AliasMatch)[[:space:]]'
+RE_ALIAS_BAD='receiver[\]?[.](v2[\]?[.])?min|LogonUISimple[\]?[.]html[\]?[.]style|/vpn/media/|[.]sig([[:space:]$]|$)|[.]receiver|[.]local_journal'
+RE_PHPFLAG='^php_flag[[:space:]]+engine[[:space:]]+on'
 if [ ! -f "$HTTPD_CONF" ]; then
     warn "$HTTPD_CONF not found - section skipped"
 else
@@ -723,10 +729,11 @@ else
         n=$((n+1))
         l="${raw#"${raw%%[![:space:]]*}"}"
         case "$l" in ''|'#'*) continue ;; esac
-        if [[ "$l" =~ ^(AddHandler|AddType)[[:space:]]+application/x-httpd-php[^[:space:]]*[[:space:]]+(.+)$ ]]; then
+        if [[ $l =~ $RE_HANDLER ]]; then
+            exts=()
             read -r -a exts <<< "${BASH_REMATCH[2]}"
-            for e in "${exts[@]}"; do
-                e="${e,,}"; e="${e#.}"
+            for e in ${exts[@]+"${exts[@]}"}; do
+                e=$(lc "$e"); e="${e#.}"
                 case "$e" in
                     php|php3|php4|php5|php7|phtml|phps) ;;
                     html|htm) warn "line $n maps .$e to PHP - compare with clean appliance: $l"; s8=$((s8+1)) ;;
@@ -734,15 +741,13 @@ else
                 esac
             done
         fi
-        if [[ "$l" =~ ^SetHandler[[:space:]]+application/x-httpd-php ]]; then
+        if [[ $l =~ $RE_SETH ]]; then
             suspect "line $n SetHandler to PHP (GreyNoise/CERT-EU webshell pattern) - check enclosing <Files> block: $l"; s8=$((s8+1))
         fi
-        if [[ "$l" =~ ^(Alias|AliasMatch)[[:space:]] ]]; then
-            if [[ "$l" =~ receiver\\?\.(v2\\?\.)?min|LogonUISimple\\?\.html\\?\.style|/vpn/media/|\.sig([[:space:]\$]|$)|\.receiver|\.local_journal ]]; then
-                confirm "line $n webshell alias (GreyNoise/GTIG/LevelBlue/Poppelgaard): $l"; s8=$((s8+1))
-            fi
+        if [[ $l =~ $RE_ALIAS ]] && [[ $l =~ $RE_ALIAS_BAD ]]; then
+            confirm "line $n webshell alias (GreyNoise/GTIG/LevelBlue/Poppelgaard): $l"; s8=$((s8+1))
         fi
-        if [[ "$l" =~ ^php_flag[[:space:]]+engine[[:space:]]+on ]]; then
+        if [[ $l =~ $RE_PHPFLAG ]]; then
             warn "line $n php_flag engine on (webshells flip this from off) - compare with clean appliance: $l"; s8=$((s8+1))
         fi
     done < "$HTTPD_CONF"
@@ -751,33 +756,70 @@ else
 fi
 
 # =====================================================================
-section "9. ns.conf: rogue accounts, SAML exposure"
-declare -A SEEN_CONF=()
+section "8. ns.conf: rogue accounts, SAML exposure, NSIP"
 s9=0
+NSIPS=""
+RE_NSIP='(^|[[:space:]])-IPAddress[[:space:]]+([0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3})([[:space:]]|$)'
 for c in /nsconfig/ns.conf /flash/nsconfig/ns.conf; do
     [ -f "$c" ] || continue
-    rc=$(realdir "$(dirname -- "$c")")/ns.conf
-    [ -n "${SEEN_CONF[$rc]:-}" ] && continue; SEEN_CONF["$rc"]=1
-    while IFS= read -r l; do
-        confirm "$c: rogue superuser sec_monitor (LevelBlue): $l"; s9=$((s9+1))
-    done < <(grep -nE '(^|[[:space:]"])sec_monitor([[:space:]"]|$)' -- "$c" 2>/dev/null)
+    rc="$(realdir "$(dirname -- "$c")")/ns.conf"
+    first_visit S_CONF "$rc" || continue
+    hits=$(grep -nE '(^|[[:space:]"])sec_monitor([[:space:]"]|$)' -- "$c" 2>/dev/null)
+    if [ -n "$hits" ]; then
+        while IFS= read -r l; do
+            confirm "$c: rogue superuser sec_monitor (LevelBlue): $l"; s9=$((s9+1))
+        done <<< "$hits"
+    fi
     nsaml=$(grep -ciE '^add authentication (samlAction|samlIdPProfile)' -- "$c" 2>/dev/null)
     if [ "${nsaml:-0}" -gt 0 ]; then
         warn "$c: $nsaml SAML action/IdP profile line(s) - in scope of Citrix SAML guidance (2 Oct 2026); no fixed build at PitScaler snapshot"
         s9=$((s9+1))
     fi
-    while IFS= read -r l; do
-        info "$c system user (review manually): $l"
-    done < <(grep -nE '^add system user ' -- "$c" 2>/dev/null | sed -E 's/(-password|-encrypted)[[:space:]]+[^[:space:]]+/\1 <redacted>/g')
+    hits=$(grep -nE '^add system user ' -- "$c" 2>/dev/null | sed -E 's/(-password|-encrypted)[[:space:]]+[^[:space:]]+/\1 <redacted>/g')
+    if [ -n "$hits" ]; then
+        while IFS= read -r l; do info "$c system user (review manually): $l"; done <<< "$hits"
+    fi
+    # NSIP: "set ns config -IPAddress <ip_addr> -netmask <netmask>" (NetScaler CLI reference, ns-config)
+    hits=$(grep -E '^set ns config ' -- "$c" 2>/dev/null)
+    if [ -n "$hits" ]; then
+        while IFS= read -r l; do
+            if [[ $l =~ $RE_NSIP ]]; then
+                ip="${BASH_REMATCH[2]}"
+                case " $NSIPS " in *" $ip "*) ;; *) NSIPS="${NSIPS:+$NSIPS }$ip" ;; esac
+            fi
+        done <<< "$hits"
+    fi
 done
 [ "$s9" -eq 0 ] && ok "No sec_monitor account and no SAML action/IdP profile in ns.conf."
 
+# Own-config-command filter for log sections. Line layout taken from appliance ns.log:
+#   "<n>:Mon dd hh:mm:ss <facility.level> <NSIP>  <date:time> <TZ> <host> 0-PPE-0 : <partition> CLI CMD_EXECUTED <seq> 0 :  User <u> - ADM_User <a> - Remote_ip <ip> - Command "..."
+# Message body per NetScaler syslog reference (UI / CMD_EXECUTED):
+#   User %s - ADM_User %s - Remote_ip %s - Command "%s" - Status "%s"
+OWN_RE=""
+OWN_MODS=""
+for m in $OWN_CMD_MODULES; do
+    case "$m" in *[!A-Z]*|'') continue ;; esac
+    OWN_MODS="${OWN_MODS:+$OWN_MODS|}$m"
+done
+if [ -z "$NSIPS" ]; then
+    warn "NSIP not found in ns.conf (set ns config -IPAddress): own-command log filter disabled"
+elif [ -z "$OWN_MODS" ]; then
+    warn "OWN_CMD_MODULES invalid: own-command log filter disabled"
+else
+    ipalt=""
+    for ip in $NSIPS; do ipalt="${ipalt:+$ipalt|}${ip//./[.]}"; done
+    OWN_RE="^[0-9]+:[A-Z][a-z][a-z] +[0-9]+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9] <[a-z0-9]+[.][a-z]+> +($ipalt) +[0-9/:]+ +[A-Za-z]+( +[^ ]+)? +[0-9]+-PPE-[0-9]+ +: +([^ ]+ +)?($OWN_MODS) CMD_EXECUTED [0-9]+ [0-9]+ : +User [-A-Za-z0-9._@]+ - (ADM_User [^ ]+ - )?Remote_ip [0-9A-Fa-f.:]+ - Command \""
+    info "NSIP(s) from ns.conf: $NSIPS - log lines '<NSIP> ... ${OWN_MODS//|/\/} CMD_EXECUTED' (clean user name) are skipped in section 10"
+fi
+own_cmd() { [ -n "$OWN_RE" ] && [[ $1 =~ $OWN_RE ]]; }
+
 # =====================================================================
-section "10. Privilege & persistence"
-perms=$(file_perms_L /bin/sh)
+section "9. Privilege & persistence"
+perms=$(ls -lLd /bin/sh 2>/dev/null); perms="${perms%% *}"
 if [ -z "$perms" ]; then
-    warn "/bin/sh: cannot stat"
-elif [[ "${perms:3:1}" == [sS] || "${perms:6:1}" == [sS] ]]; then
+    warn "/bin/sh: cannot read permissions"
+elif [[ ${perms:3:1} == [sS] || ${perms:6:1} == [sS] ]]; then
     confirm "/bin/sh has setuid/setgid ($perms), expected -r-xr-xr-x (GTIG/GreyNoise/Beazley)"
 else
     ok "/bin/sh permissions $perms"
@@ -785,35 +827,36 @@ fi
 s10=0
 for d in /tmp /var/tmp /var/netscaler/logon /netscaler/ns_gui /var/netscaler/gui /var/core; do
     [ -d "$d" ] || continue
+    newtmp; L="$TMPF"
+    find "$d" -xdev -type f \( -perm -4000 -o -perm -2000 \) -print0 > "$L" 2>/dev/null
     while IFS= read -r -d '' f; do
-        confirm "setuid/setgid file in writable/web dir: $f [$(ftype "$f")]"; describe_file "$f"; s10=$((s10+1))
-    done < <(find "$d" -xdev -type f \( -perm -4000 -o -perm -2000 \) -print0 2>/dev/null)
+        confirm "setuid/setgid file in writable/web dir: $f [$(ftype "$f")]"; detail "$(file_meta "$f")"; s10=$((s10+1))
+    done < "$L"
 done
 [ "$s10" -eq 0 ] && ok "No setuid/setgid files in temp/web dirs."
 
 PERSIST_FILES=( /etc/crontab /nsconfig/crontab /flash/nsconfig/crontab /var/cron/tabs/root
                 /nsconfig/rc.netscaler /flash/nsconfig/rc.netscaler
                 /nsconfig/nsbefore.sh /nsconfig/nsafter.sh /flash/nsconfig/nsbefore.sh /flash/nsconfig/nsafter.sh )
-P_CONF='nsmon\.pl|\.slap/|boot\.sh|slapshot|whipd|/var/tmp/\.[A-Za-z]|/netscaler\.local|\.ns-cache'
-P_SUSP='(curl|wget|fetch)[[:space:]].*(\||;|-o)|\|[[:space:]]*(sh|bash|perl|python)|base64|/dev/tcp|nc[[:space:]]+-e|(^|[[:space:]])/v([[:space:]]|$)|(^|[[:space:]])/\.x|chmod[[:space:]]+[ug]?\+?s|chmod[[:space:]]+[2467][0-7]{3}'
-declare -A SEEN_P=()
+P_CONF='nsmon[.]pl|[.]slap/|boot[.]sh|slapshot|whipd|/var/tmp/[.][A-Za-z]|/netscaler[.]local|[.]ns-cache'
+P_SUSP='(curl|wget|fetch)[[:space:]].*([|]|;|-o)|[|][[:space:]]*(sh|bash|perl|python)|base64|/dev/tcp|nc[[:space:]]+-e|(^|[[:space:]])/v([[:space:]]|$)|(^|[[:space:]])/[.]x|chmod[[:space:]]+[ug]?[+]?s|chmod[[:space:]]+[2467][0-7][0-7][0-7]'
 s10b=0
 for pf in "${PERSIST_FILES[@]}"; do
     [ -f "$pf" ] || continue
-    rp=$(realdir "$(dirname -- "$pf")")/${pf##*/}
-    [ -n "${SEEN_P[$rp]:-}" ] && continue; SEEN_P["$rp"]=1
+    rp="$(realdir "$(dirname -- "$pf")")/${pf##*/}"
+    first_visit S_P "$rp" || continue
     n=0
     while IFS= read -r raw || [ -n "$raw" ]; do
         n=$((n+1)); l="${raw#"${raw%%[![:space:]]*}"}"
         case "$l" in ''|'#'*) continue ;; esac
-        if [[ "$l" =~ $P_CONF ]]; then confirm "$pf:$n known implant persistence: $l"; s10b=$((s10b+1))
-        elif [[ "$l" =~ $P_SUSP ]]; then suspect "$pf:$n download/exec/suid pattern: $l"; s10b=$((s10b+1)); fi
+        if [[ $l =~ $P_CONF ]]; then confirm "$pf:$n known implant persistence: $l"; s10b=$((s10b+1))
+        elif [[ $l =~ $P_SUSP ]]; then suspect "$pf:$n download/exec/suid pattern: $l"; s10b=$((s10b+1)); fi
     done < "$pf"
 done
 [ "$s10b" -eq 0 ] && ok "No suspicious entries in crontab / rc.netscaler / nsbefore / nsafter."
 
 # =====================================================================
-section "11. Logs"
+section "10. Logs"
 log_stream() {
     case "$1" in
         *.gz)  gzip  -dc -- "$1" 2>/dev/null ;;
@@ -821,149 +864,187 @@ log_stream() {
         *)     cat   -- "$1" 2>/dev/null ;;
     esac
 }
-SYS_LOGS=(); for f in /var/log/ns.log /var/log/ns.log.* /var/log/messages /var/log/messages.*; do [ -f "$f" ] && SYS_LOGS+=( "$f" ); done
-ACC_LOGS=(); for f in /var/log/httpaccess.log /var/log/httpaccess.log.* /var/log/httpaccess-vpn.log /var/log/httpaccess-vpn.log.* \
-                     /var/log/httperror.log /var/log/httperror.log.* /var/log/httperror-vpn.log /var/log/httperror-vpn.log.*; do
-    [ -f "$f" ] && ACC_LOGS+=( "$f" ); done
-[ "${#SYS_LOGS[@]}" -eq 0 ] && warn "No ns.log/messages found under /var/log"
-[ "${#ACC_LOGS[@]}" -eq 0 ] && warn "No httpaccess/httperror logs found under /var/log"
-info "Logs rotate: no hit here does not mean no attempt (Beaumont: Console check misses rotated logs). Check your SIEM too."
+SYS_LOGS=(); NSYS=0
+for f in /var/log/ns.log /var/log/ns.log.* /var/log/messages /var/log/messages.*; do
+    [ -f "$f" ] && { SYS_LOGS+=( "$f" ); NSYS=$((NSYS+1)); }
+done
+ACC_LOGS=(); NACC=0
+for f in /var/log/httpaccess.log /var/log/httpaccess.log.* /var/log/httpaccess-vpn.log /var/log/httpaccess-vpn.log.* \
+         /var/log/httperror.log /var/log/httperror.log.* /var/log/httperror-vpn.log /var/log/httperror-vpn.log.*; do
+    [ -f "$f" ] && { ACC_LOGS+=( "$f" ); NACC=$((NACC+1)); }
+done
+[ "$NSYS" -eq 0 ] && warn "No ns.log/messages found under /var/log"
+[ "$NACC" -eq 0 ] && warn "No httpaccess/httperror logs found under /var/log"
+info "Logs rotate: no hit here does not mean no attempt. Check your SIEM too."
 
-declare -A SHOWN=()
-show() {   # level file message ; per file+level cap
-    local lvl="$1" f="$2" msg="$3" key="$1|$2"
-    SHOWN["$key"]=$(( ${SHOWN[$key]:-0} + 1 ))
-    [ "${SHOWN[$key]}" -le "$MAX_HITS" ] && emit_level "$lvl" "$msg"
+SH_C=0; SH_S=0; SH_W=0; SH_I=0
+reset_caps() { SH_C=0; SH_S=0; SH_W=0; SH_I=0; }
+show() {
+    local n
+    case "$1" in
+        C) SH_C=$((SH_C+1)); n=$SH_C ;;
+        S) SH_S=$((SH_S+1)); n=$SH_S ;;
+        W) SH_W=$((SH_W+1)); n=$SH_W ;;
+        *) SH_I=$((SH_I+1)); n=$SH_I ;;
+    esac
+    [ "$n" -le "$MAX_HITS" ] && emit_level "$1" "$2"
+    return 0
 }
 cap_note() {
-    local f="$1" lvl c
-    for lvl in C S W; do
-        c=${SHOWN["$lvl|$f"]:-0}
-        [ "$c" -gt "$MAX_HITS" ] && info "$f: $((c-MAX_HITS)) more [$lvl] lines not shown (cap $MAX_HITS)"
-    done
+    [ "$SH_C" -gt "$MAX_HITS" ] && info "$1: $((SH_C-MAX_HITS)) more [CONFIRMED] lines not shown (cap $MAX_HITS)"
+    [ "$SH_S" -gt "$MAX_HITS" ] && info "$1: $((SH_S-MAX_HITS)) more [SUSPECTED] lines not shown (cap $MAX_HITS)"
+    [ "$SH_W" -gt "$MAX_HITS" ] && info "$1: $((SH_W-MAX_HITS)) more [WARNING] lines not shown (cap $MAX_HITS)"
+    return 0
 }
+own_note() { [ "$2" -gt 0 ] && info "$1: $2 own config-command line(s) skipped (NSIP + ${OWN_MODS//|/\/} CMD_EXECUTED)"; return 0; }
 
-META_RE='[;|`]|\$\(|\$\{IFS\}|\$IFS|b64decode|base64|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]]|/dev/tcp|nc[[:space:]]+-e|whoami|printf[[:space:]]'
-SYS_RE='pitboss|NSPPE|missed too many heartbeats|unexpectedly died|nsaaad.*(SIGNALED|EXITED)|maximum number of restarts|declaring system failure|All monitored processes have exited|scanner-probe|SSL_HANDSHAKE_FAILURE|\$\{IFS\}|b64decode'
+META_RE='[;|`]|[$][(]|[$][{]IFS[}]|[$]IFS|b64decode|base64|curl[[:space:]]|wget[[:space:]]|fetch[[:space:]]|/dev/tcp|nc[[:space:]]+-e|whoami|printf[[:space:]]'
+SYS_RE='pitboss|NSPPE|missed too many heartbeats|unexpectedly died|nsaaad.*(SIGNALED|EXITED)|maximum number of restarts|declaring system failure|All monitored processes have exited|scanner-probe|SSL_HANDSHAKE_FAILURE|[$][{]IFS[}]|b64decode'
 CRASH_RE='nsaaad.*(SIGNALED|EXITED)|maximum number of restarts|declaring system failure|All monitored processes have exited'
+POISON_CTX_RE='pitboss|NSPPE|heartbeats|unexpectedly died|LOGIN|[Uu]ser'
+IFS_RE='[$][{]IFS[}]|b64decode'
 s11=0
-for f in "${SYS_LOGS[@]}"; do
-    nsppe=0; dtls=0
+if [ "$NSYS" -gt 0 ]; then
+  for f in "${SYS_LOGS[@]}"; do
+    reset_caps; nsppe=0; dtls=0; own_skip=0
+    newtmp; L="$TMPF"
+    log_stream "$f" | grep -nE -- "$SYS_RE" > "$L" 2>/dev/null
     while IFS= read -r line; do
-        if [[ "$line" =~ SSL_HANDSHAKE_FAILURE ]]; then
-            [[ "$line" == *DTLS* ]] && dtls=1
+        if own_cmd "$line"; then own_skip=$((own_skip+1)); continue; fi
+        if [[ $line == *SSL_HANDSHAKE_FAILURE* ]]; then
+            [[ $line == *DTLS* ]] && dtls=1
             continue
         fi
-        if [[ "$line" =~ pitboss|NSPPE|heartbeats|unexpectedly\ died|LOGIN|[Uu]ser ]] && [[ "$line" =~ $META_RE ]]; then
-            show S "$f" "$f: log-poisoning exploitation ATTEMPT (execution not proven): $line"; s11=$((s11+1))
-        elif [[ "$line" == *scanner-probe* ]]; then
-            show S "$f" "$f: recon username scanner-probe (Arctic Wolf): $line"; s11=$((s11+1))
-        elif [[ "$line" == *"pitboss NOT restarting NSPPE"* ]]; then
-            nsppe=1; show W "$f" "$f: NSPPE crash watchdog line (GTIG CVE-2026-88772 indicator when paired with DTLS failure): $line"; s11=$((s11+1))
-        elif [[ "$line" =~ $CRASH_RE ]]; then
-            show W "$f" "$f: nsaaad crash/restart (Beaumont SAML-issue pattern; other causes possible): $line"; s11=$((s11+1))
-        elif [[ "$line" =~ \$\{IFS\}|b64decode ]]; then
-            show S "$f" "$f: IFS/b64decode in log line: $line"; s11=$((s11+1))
+        if [[ $line =~ $POISON_CTX_RE ]] && [[ $line =~ $META_RE ]]; then
+            show S "$f: log-poisoning exploitation ATTEMPT (execution not proven): $line"; s11=$((s11+1))
+        elif [[ $line == *scanner-probe* ]]; then
+            show S "$f: recon username scanner-probe (Arctic Wolf): $line"; s11=$((s11+1))
+        elif [[ $line == *"pitboss NOT restarting NSPPE"* ]]; then
+            nsppe=1; show W "$f: NSPPE crash watchdog line (GTIG CVE-2026-88772 indicator when paired with DTLS failure): $line"; s11=$((s11+1))
+        elif [[ $line =~ $CRASH_RE ]]; then
+            show W "$f: nsaaad crash/restart (Beaumont SAML-issue pattern; other causes possible): $line"; s11=$((s11+1))
+        elif [[ $line =~ $IFS_RE ]]; then
+            show S "$f: IFS/b64decode in log line: $line"; s11=$((s11+1))
         else
-            show W "$f" "$f: heartbeat/died message without injection syntax: $line"; s11=$((s11+1))
+            show W "$f: heartbeat/died message without injection syntax: $line"; s11=$((s11+1))
         fi
-    done < <(log_stream "$f" | grep -nE -- "$SYS_RE")
+    done < "$L"
     if [ "$nsppe" -eq 1 ] && [ "$dtls" -eq 1 ]; then
         suspect "$f: NSPPE crash AND DTLS handshake failure in same log (GTIG CVE-2026-88772 pattern) - correlate timestamps"
     fi
-    cap_note "$f"
-done
+    cap_note "$f"; own_note "$f" "$own_skip"
+  done
+fi
 
-ACC_RE='/vpn/media/[^ "?]*\.ico|/vpn/scripts/linux/|receiver\.(v2\.)?min|LogonUISimple\.html\.style|ns-88771-poc|PoCbit|Python-urllib|platypus-agent|PD9[A-Za-z0-9+/]{16,}|\$\{IFS\}|%24%7BIFS%7D|e826d7ddf3c85920|NSC_TASS=[^;" ]*(%7C|%3B|%60|%24%28)|(doAuthentication\.do|/cgi/login|doLogon\.do|tmindex\.html|GetUserName)[^ ]*(%3B|%7C|%60|%24%28|;|\|)'
-for f in "${ACC_LOGS[@]}"; do
-    legit_dl=0
+ACC_RE='/vpn/media/[^ "?]*[.]ico|/vpn/scripts/linux/|receiver[.](v2[.])?min|LogonUISimple[.]html[.]style|ns-88771-poc|PoCbit|Python-urllib|platypus-agent|PD9[A-Za-z0-9+/]{16,}|[$][{]IFS[}]|%24%7BIFS%7D|e826d7ddf3c85920|NSC_TASS=[^;" ]*(%7C|%3B|%60|%24%28)|(doAuthentication[.]do|/cgi/login|doLogon[.]do|tmindex[.]html|GetUserName)[^ ]*(%3B|%7C|%60|%24%28|;|[|])'
+U42_RE='/vpn/scripts/linux/(nsg64|nsgser18|nsgsupport|nsgpackage64|nsgbuild)[.]deb|/vpn/scripts/linux/nginstaller|/vpn/scripts/linux/[^ "?]*[.]php'
+PD9_RE='PD9[A-Za-z0-9+/]{16,}'
+ICO_RE='/vpn/media/[^ "?]*[.]ico'
+ALIASREQ_RE='receiver[.](v2[.])?min|LogonUISimple[.]html[.]style'
+TOKEN_RE='e826d7ddf3c85920|NSC_TASS='
+POC_RE='ns-88771-poc|PoCbit'
+if [ "$NACC" -gt 0 ]; then
+  for f in "${ACC_LOGS[@]}"; do
+    reset_caps; legit_dl=0
+    newtmp; L="$TMPF"
+    log_stream "$f" | grep -nE -- "$ACC_RE" > "$L" 2>/dev/null
     while IFS= read -r line; do
-        if [[ "$line" =~ /vpn/scripts/linux/(nsg64|nsgser18|nsgsupport|nsgpackage64|nsgbuild)\.deb|/vpn/scripts/linux/nginstaller|/vpn/scripts/linux/[^\ \"?]*\.php ]]; then
-            show S "$f" "$f: request to published webshell name in /vpn/scripts/linux (GTIG/Unit 42): $line"; s11=$((s11+1))
-        elif [[ "$line" == */vpn/scripts/linux/* ]]; then
+        if [[ $line =~ $U42_RE ]]; then
+            show S "$f: request to published webshell name in /vpn/scripts/linux (GTIG/Unit 42): $line"; s11=$((s11+1))
+        elif [[ $line == */vpn/scripts/linux/* ]]; then
             legit_dl=$((legit_dl+1))
-        elif [[ "$line" =~ PD9[A-Za-z0-9+/]{16,} ]]; then
-            show S "$f" "$f: base64 PHP ('PD9') in request - access-log payload staging (eSentire/CERT-EU): $line"; s11=$((s11+1))
-        elif [[ "$line" =~ /vpn/media/[^\ \"?]*\.ico ]]; then
-            show S "$f" "$f: /vpn/media/*.ico request (GTIG .sig-webshell route): $line"; s11=$((s11+1))
-        elif [[ "$line" =~ receiver\.(v2\.)?min|LogonUISimple\.html\.style ]]; then
-            show S "$f" "$f: request to webshell alias (GreyNoise/LevelBlue/Poppelgaard): $line"; s11=$((s11+1))
-        elif [[ "$line" =~ e826d7ddf3c85920|NSC_TASS= ]]; then
-            show S "$f" "$f: .ctxs.receiver token / NSC_TASS command cookie: $line"; s11=$((s11+1))
-        elif [[ "$line" =~ ns-88771-poc|PoCbit ]]; then
-            show S "$f" "$f: PoC/scanner User-Agent (someone tested the box): $line"; s11=$((s11+1))
-        elif [[ "$line" == *platypus-agent* ]]; then
-            show S "$f" "$f: Platypus agent User-Agent (TENEX): $line"; s11=$((s11+1))
-        elif [[ "$line" == *Python-urllib* ]]; then
-            show W "$f" "$f: Python-urllib client (only meaningful with auth-endpoint payload): $line"; s11=$((s11+1))
+        elif [[ $line =~ $PD9_RE ]]; then
+            show S "$f: base64 PHP ('PD9') in request - access-log payload staging (eSentire/CERT-EU): $line"; s11=$((s11+1))
+        elif [[ $line =~ $ICO_RE ]]; then
+            show S "$f: /vpn/media/*.ico request (GTIG .sig-webshell route): $line"; s11=$((s11+1))
+        elif [[ $line =~ $ALIASREQ_RE ]]; then
+            show S "$f: request to webshell alias (GreyNoise/LevelBlue/Poppelgaard): $line"; s11=$((s11+1))
+        elif [[ $line =~ $TOKEN_RE ]]; then
+            show S "$f: .ctxs.receiver token / NSC_TASS command cookie: $line"; s11=$((s11+1))
+        elif [[ $line =~ $POC_RE ]]; then
+            show S "$f: PoC/scanner User-Agent (someone tested the box): $line"; s11=$((s11+1))
+        elif [[ $line == *platypus-agent* ]]; then
+            show S "$f: Platypus agent User-Agent (TENEX): $line"; s11=$((s11+1))
+        elif [[ $line == *Python-urllib* ]]; then
+            show W "$f: Python-urllib client (only meaningful with auth-endpoint payload): $line"; s11=$((s11+1))
         else
-            show S "$f" "$f: shell metacharacters / IFS in request: $line"; s11=$((s11+1))
+            show S "$f: shell metacharacters / IFS in request: $line"; s11=$((s11+1))
         fi
-    done < <(log_stream "$f" | grep -nE -- "$ACC_RE")
-    [ "$legit_dl" -gt 0 ] && info "$f: $legit_dl requests for other files in /vpn/scripts/linux (normal VPN client downloads; file content is checked in section 2)"
+    done < "$L"
+    [ "$legit_dl" -gt 0 ] && info "$f: $legit_dl requests for other files in /vpn/scripts/linux (normal VPN client downloads; content checked in section 2)"
     cap_note "$f"
-done
+  done
+fi
 
-# IPs and domains in all logs
-for f in "${SYS_LOGS[@]}" "${ACC_LOGS[@]}"; do
+ALL_LOGS=( ${SYS_LOGS[@]+"${SYS_LOGS[@]}"} ${ACC_LOGS[@]+"${ACC_LOGS[@]}"} )
+if [ $((NSYS + NACC)) -gt 0 ]; then
+  for f in "${ALL_LOGS[@]}"; do
+    reset_caps; own_skip=0
+    newtmp; L="$TMPF"
+    log_stream "$f" | grep -niwF "${IP_GREP_ARGS[@]}" "${DOM_GREP_ARGS[@]}" > "$L" 2>/dev/null
     while IFS= read -r line; do
+        if own_cmd "$line"; then own_skip=$((own_skip+1)); continue; fi
         lvl=""; what=""
         for ip in "${IP_STRONG[@]}"; do
-            if [[ "$line" == *"$ip"* ]] && ip_in_line "$ip" "$line"; then lvl=S; what="IoC IP $ip"; break; fi
+            if [[ $line == *"$ip"* ]] && ip_in_line "$ip" "$line"; then lvl=S; what="IoC IP $ip"; break; fi
         done
         if [ -z "$lvl" ]; then
             for ip in "${IP_NOISY[@]}"; do
-                if [[ "$line" == *"$ip"* ]] && ip_in_line "$ip" "$line"; then lvl=W; what="IoC IP $ip (shared/residential/VPN - weak)"; break; fi
+                if [[ $line == *"$ip"* ]] && ip_in_line "$ip" "$line"; then lvl=W; what="IoC IP $ip (shared/residential/VPN - weak)"; break; fi
             done
         fi
-        lline="${line,,}"
+        lline=$(lc "$line")
         for dm in "${DOMAINS_SUSP[@]}"; do
-            if [[ "$lline" == *"$dm"* ]]; then lvl=S; what="${what:+$what, }IoC domain $dm"; break; fi
+            if [[ $lline == *"$dm"* ]]; then lvl=S; what="${what:+$what, }IoC domain $dm"; break; fi
         done
         if [ -z "$lvl" ]; then
             for dm in "${DOMAINS_WARN[@]}"; do
-                if [[ "$lline" == *"$dm"* ]]; then lvl=W; what="domain $dm (legit service, abused)"; break; fi
+                if [[ $lline == *"$dm"* ]]; then lvl=W; what="domain $dm (legit service, abused)"; break; fi
             done
         fi
         [ -n "$lvl" ] || continue
-        show "$lvl" "$f#net" "$f: $what: $line"; s11=$((s11+1))
-    done < <(log_stream "$f" | grep -nwF "${IP_GREP_ARGS[@]}" "${DOM_GREP_ARGS[@]}")
-    cap_note "$f#net"
-done
+        show "$lvl" "$f: $what: $line"; s11=$((s11+1))
+    done < "$L"
+    cap_note "$f (IP/domain)"; own_note "$f (IP/domain)" "$own_skip"
+  done
+fi
 info "Cloudflare WARP egress IPs (104.28.x) are not scanned: shared by unrelated users."
 [ "$s11" -eq 0 ] && ok "No log indicators found in available logs."
 
 # =====================================================================
-section "12. Network (live, read-only)"
+section "11. Network (live, read-only)"
 if command -v sockstat >/dev/null 2>&1; then
     LISTEN=$(sockstat -46l 2>/dev/null)
 else
     LISTEN=$(netstat -an 2>/dev/null | grep -i listen)
 fi
-PORT_RE='[.:](41[0-9]{3}|9909|9910)([[:space:]]|$)'
+PORT_RE='[.:](41[0-9][0-9][0-9]|9909|9910)([[:space:]]|$)'
+PROC_RE='perl|python'
 s12=0
-while IFS= read -r l; do
-    [[ "$l" =~ $PORT_RE ]] || continue
-    if [[ "$l" =~ perl|python ]]; then
-        suspect "Listener in nsmon.pl/SAML-kit range by perl/python: $l"
-    else
-        warn "Listener in nsmon.pl range 41000-41999 or 9909/9910 (could be legitimate): $l"
-    fi
-    s12=$((s12+1))
-done <<< "$LISTEN"
-CONNS=$(netstat -an 2>/dev/null)
-for ip in "${IP_STRONG[@]}"; do
+if [ -n "$LISTEN" ]; then
     while IFS= read -r l; do
-        ip_in_line "$ip" "$l" || continue
-        confirm "Live socket to IoC IP $ip: $l"; s12=$((s12+1))
-    done < <(printf '%s\n' "$CONNS" | grep -wF -e "$ip")
-done
-for ip in "${IP_NOISY[@]}"; do
+        [[ $l =~ $PORT_RE ]] || continue
+        if [[ $l =~ $PROC_RE ]]; then
+            suspect "Listener in nsmon.pl/SAML-kit range by perl/python: $l"
+        else
+            warn "Listener in nsmon.pl range 41000-41999 or 9909/9910 (could be legitimate): $l"
+        fi
+        s12=$((s12+1))
+    done <<< "$LISTEN"
+fi
+CONN_HITS=$(netstat -an 2>/dev/null | grep -wF "${IP_GREP_ARGS[@]}")
+if [ -n "$CONN_HITS" ]; then
     while IFS= read -r l; do
-        ip_in_line "$ip" "$l" || continue
-        suspect "Live socket to shared/noisy IoC IP $ip: $l"; s12=$((s12+1))
-    done < <(printf '%s\n' "$CONNS" | grep -wF -e "$ip")
-done
+        hit=""
+        for ip in "${IP_STRONG[@]}"; do
+            if ip_in_line "$ip" "$l"; then confirm "Live socket to IoC IP $ip: $l"; hit=1; s12=$((s12+1)); break; fi
+        done
+        [ -n "$hit" ] && continue
+        for ip in "${IP_NOISY[@]}"; do
+            if ip_in_line "$ip" "$l"; then suspect "Live socket to shared/noisy IoC IP $ip: $l"; s12=$((s12+1)); break; fi
+        done
+    done <<< "$CONN_HITS"
+fi
 [ "$s12" -eq 0 ] && ok "No suspicious listeners and no live sockets to IoC IPs."
 
 # =====================================================================
@@ -972,7 +1053,7 @@ printf '%sCONFIRMED: %d%s   %sSUSPECTED: %d%s   %sWARNING: %d%s\n' \
     "$C_RED" "$N_CONF" "$C_RESET" "$C_ORANGE" "$N_SUSP" "$C_RESET" "$C_YELLOW" "$N_WARN" "$C_RESET"
 printf 'CONFIRMED: %d   SUSPECTED: %d   WARNING: %d\n' "$N_CONF" "$N_SUSP" "$N_WARN" >> "$REPORT"
 info "Report: $REPORT"
-info "A clean result does NOT prove a clean appliance: webshell names, tokens, IPs and hashes are per victim (Beaumont, GTIG). Preserve evidence before patching; patching does not remove backdoors."
+info "A clean result does NOT prove a clean appliance: webshell names, tokens and IPs are per victim. Preserve evidence before patching; patching does not remove backdoors."
 
 if   [ "$N_CONF" -gt 0 ]; then exit 2
 elif [ "$N_SUSP" -gt 0 ]; then exit 1
